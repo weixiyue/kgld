@@ -11,6 +11,9 @@ data:
   downsample_stride: 10
   downsample_scope: unit
   sample_scope: full_flight
+  normalization: minmax_0_1
+  normalization_fit: raw_dev_before_downsampling
+  normalization_clip: false
 
 model:
   sensor_hidden_dim: 64

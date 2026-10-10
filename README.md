@@ -8,8 +8,8 @@
 
 | 任务 | 状态 | 验证摘要 | 用户确认记录 |
 |---|---|---|---|
-| T0 初始化 | 已完成，待验收 | 七项依赖导入通过；YAML 和三个文件路径检查通过；忽略规则通过；交付对应本地 T0 提交 | 用户已授权执行；尚未确认验收 |
-| T1 数据管线 | 未开始 | 未验证真实数据字段、flight 或 HI 关联 | 设计与数值已批准；待 T0 验收及启动批准 |
+| T0 初始化 | 已验收 | 依赖、路径及忽略规则通过；commit b98f60d | 用户回复“开始T1”，确认继续 |
+| T1 数据管线 | 已完成，待验收 | 真实数据全量索引、归一化、mask、HI 关联检查通过；重复预处理一致 | 用户已授权执行；已确认归一化口径；待验收 |
 | T2 模型与损失 | 未开始 | 未验证前向、掩码或损失 | 设计与数值已批准；待 T1 验收 |
 | T3 表示学习 | 未开始 | 未执行 smoke 或正式训练 | 设计与预算已批准；待 T2 验收 |
 | T4 排序学习 | 未开始 | 未验证冻结、采样或推理 | 设计与预算已批准；待 T3 验收 |
@@ -17,6 +17,7 @@
 
 T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
 并将用户提供的两份规则与方案文件纳入首次本地提交。Python 实现文件按后续任务创建。
+T1 新增 data.py 与 verify.py 的数据验证入口，更新数据配置和本文记录。
 
 ## 环境与 T0 验证
 
@@ -46,18 +47,18 @@ pandas 3.0.3，h5py 3.16.0，SciPy 1.17.1，scikit-learn 1.9.1，PyYAML 6.0.3。
 初次导入检查因缺少 scikit-learn 失败，安装该必需依赖后重验退出码为 0。
 `torch.cuda.is_available()` 为 False，本次环境检查设备为 CPU；未验证 GPU 训练。
 YAML 解析和三个路径检查退出码为 0，`Missing files: []`；四项忽略检查通过。
-当前仅完成 T0 环境验证，未进行合成数据验证、真实数据内容验证、smoke 或正式训练。
+以上为 T0 环境验证记录；T1 真实数据验证结果见下文。未执行 smoke 或正式训练。
 验收以交付回复中的完整 commit 为准，可用 `git log -1 --oneline` 查看。
 
 ## 数据位置与已批准配置
 
 config.yaml 使用可移植相对路径。当前已发现：
 
-| 用途 | 路径 | T0 检查范围 |
+| 用途 | 路径 | 当前检查范围 |
 |---|---|---|
-| 原始 DS03 | `data/raw/N-CMAPSS_DS03-012.h5` | 文件存在，内容待 T1 核对 |
-| dev HI 参考 | `data/raw/N-CMAPSS_DS03_cycle_dev.h5` | 文件存在，关联待 T1 核对 |
-| test HI 参考 | `data/raw/N-CMAPSS_DS03_cycle_test.h5` | 文件存在，关联待 T1 核对 |
+| 原始 DS03 | `data/raw/N-CMAPSS_DS03-012.h5` | X_s/W/A 字段、unit/cycle 和全量采样对齐通过 |
+| dev HI 参考 | `data/raw/N-CMAPSS_DS03_cycle_dev.h5` | 663 条逐 flight 关联通过 |
+| test HI 参考 | `data/raw/N-CMAPSS_DS03_cycle_test.h5` | 438 条逐 flight 关联通过 |
 
 已有 `data/raw` 是本地符号链接，整个 data 目录被 Git 忽略；不提交链接目标的个人绝对路径。
 当前项目路径和 Git 身份已提供，无缺少的 T0 环境信息。
@@ -82,5 +83,60 @@ Stage 2 冻结表示模块，`h=sigmoid(-g(mu_I))`。
 HI/RUL 仅作评价；归一化与全局 HI Min–Max 仅由训练数据或训练预测拟合。
 结构不保证表示解耦或物理尺度标定，不使用测试标签选模或早停。
 
-当前尚未创建数据、模型、训练或评价实现，未运行任何训练。
+当前已创建数据管线及数据验证入口，尚未创建模型、训练或评价指标实现，未运行任何训练。
 本项目仅使用本地 Git，不配置远端，不 push。原始数据、缓存、权重、outputs 和凭据不提交。
+
+## T1 运行与真实数据验证
+
+在项目根目录执行：
+
+```bash
+python data.py --config config.yaml --prepare
+python verify.py --task data --config config.yaml
+```
+
+预处理生成 `data/processed/ds03.pt`（Git 忽略），保存 dev/test flight 列表、列名、
+数据设置与训练归一化参数。无 HI/RUL 标签，训练准备路径不读取两个参考表或原始 Y/T 字段。
+`load_processed(config)` 加载预处理结果；`FlightDataset(processed, 'dev'/'test')`
+返回 x/w/unit/cycle；`collate_fn` 输出 x/w/mask/unit/cycle，float32 序列按批次最长 flight
+补零，bool mask 根据真实长度生成，unit/cycle 为 int64。
+
+预期两条命令均退出 0，验证末行显示 `PASS: T1 real DS03 data verification (not smoke or training)`。
+缺文件、配置不符、字段/关联不一致等错误返回非零退出码，不回退到合成数据。
+
+| split | 设备 | flight 数 | 下采样后长度 | X/W 维数 |
+|---|---|---|---|---|
+| dev | 1–9 | 663 | 312–2029 | 14/4 |
+| test | 10–15 | 438 | 312–2029 | 14/4 |
+
+实际样本：dev `(1,1)` 长度 568，`(1,2)` 长度 312；test `(10,1)` 长度 1666，
+`(10,2)` 长度 1773。命令还显示原始行数和首个采样行，便于核对跨 flight 连续采样相位。
+没有引入验证集，dev/test 设备无重叠，unit/cycle 唯一、周期递增、无状态重置迹象。
+
+用户对归一化问题回复“+是”，确认采用参考口径：X/W 各列在下采样前的全部原始 dev
+时间点拟合 [0,1] Min–Max；test 原样使用训练参数，不裁剪。此确认体现在 config.yaml
+的 normalization、normalization_fit 和 normalization_clip。实际没有常数列；常数列遵循
+MinMaxScaler 的分母取 1 约定，不加 epsilon。读取按设备组织，每次只持有当前设备的原始 X/W，
+避免同时载入全部无关 HDF5 数组。每 10 点取 1 点保持设备内相位，不在 flight 边界重启。
+
+实际验证已核对每条 flight 的全部采样元素、X/W 共用行索引、长度、填充和 mask，
+并独立从原始 dev 重算归一化极值。test 存在 3 个元素低于 0、46 个高于 1，均保留。
+有效零值仍在 mask 内。全部训练批次只有约定的五个字段。
+
+HI 表为 pandas fixed HDF 格式，直接由已有 h5py 读取数值块，不新增 PyTables 依赖。
+`read_reference(path, flights)` 为独立评价读取函数，返回 unit/cycle/hi_gt。
+表中没有显式 cycle；已检查存储行索引连续、设备行连续、每台设备行数与原始完整 flight
+一致，且原始 cycle 恰为 1..N，随后按参考 Notebook 的设备内原始行顺序生成 cycle。
+这属于经过核对的参考行顺序约定；文件没有额外周期字段可供独立交叉核验。
+删除一条 flight 后关联被明确拒绝；配置与预处理设置不符时验证 CLI 实测返回退出码 1。
+
+预处理实际执行两次，产物 SHA-256 均为
+`b53a31a302e4aafafd635b38a4ad3fc1a9a863a9641d675a0402df7536cdaf17`，结果一致。
+`python -m py_compile data.py verify.py` 及 Git diff 空白检查通过。
+本次为真实数据验证，另含有效零值的 mask 检查；没有运行模型、smoke、训练或评价指标。
+
+参考资料仅用于核对采样、归一化及 HI 顺序口径，代码独立实现。
+记录的参考仓库 commit 为 `157ebfae7baeee1e0cd52180f8e58ead3dcb448e`：
+[预处理 Notebook](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/01_data_preprocess.ipynb)、
+[采样函数](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/pre_process_utils.py)。
+仅沿用已确认的原始 dev/test 与完整 flight 路径。
