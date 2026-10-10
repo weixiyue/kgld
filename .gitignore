@@ -1,0 +1,28 @@
+# Raw data (including local symlinks), processed data and run artifacts
+/data/
+/outputs/
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.npz
+*.npy
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local paths, credentials and editor settings
+.env
+.env.*
+!.env.example
+config.local.yaml
+.aws/
+*.pem
+*.key
+.idea/
+.vscode/
