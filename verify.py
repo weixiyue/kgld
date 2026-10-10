@@ -1,6 +1,7 @@
 """Task-scoped verification. Failures always return a nonzero exit code."""
 
 import argparse
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -109,12 +110,88 @@ def verify_data(config):
     print("PASS: T1 real DS03 data verification (not smoke or training)")
 
 
+def plot_data(config, split, unit, cycle, parameters):
+    """Plot one sampled flight and the unit's full reference HI trajectory."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    processed = load_processed(config)
+    flights = processed[split]
+    selected = [f for f in flights if f["unit"] == unit and f["cycle"] == cycle]
+    check(len(selected) == 1, f"Expected one flight for split={split}, unit={unit}, cycle={cycle}")
+    check(len(parameters) == len(set(parameters)), "Duplicate parameter names")
+    columns = processed["columns"]
+    lookup = {}
+    for field in ("x", "w"):
+        for index, name in enumerate(columns[field]):
+            check(name not in lookup, f"Ambiguous X/W parameter name: {name}")
+            lookup[name] = (field, index)
+    unknown = set(parameters) - set(lookup)
+    check(not unknown, f"Unknown parameters: {sorted(unknown)}; available: {list(lookup)}")
+    reference = read_reference(config["data"][f"hi_{split}_path"], flights)
+    reference = reference.loc[reference.unit == unit].sort_values("cycle")
+    expected_cycles = sorted(f["cycle"] for f in flights if f["unit"] == unit)
+    check(reference.cycle.tolist() == expected_cycles, "Incomplete unit HI trajectory")
+    flight = selected[0]
+    length = len(flight["x"])
+    check(length == len(flight["w"]), "X/W flight length mismatch")
+    positions = (flight["first_sample_row"] - flight["raw_start"]
+                 + np.arange(length) * config["data"]["downsample_stride"])
+    figure, axes = plt.subplots(len(parameters) + 1, 1,
+                                figsize=(11, 2.5 * (len(parameters) + 1)), layout="constrained")
+    figure.suptitle(f"DS03 {split} | unit {unit} | flight cycle {cycle}")
+    try:
+        for axis, name in zip(axes[:-1], parameters):
+            field, index = lookup[name]
+            values = flight[field][:, index].numpy()
+            check(np.isfinite(values).all(), f"Nonfinite parameter: {name}")
+            line, = axis.plot(positions, values, linewidth=1.1)
+            check(np.array_equal(line.get_xdata(), positions) and np.array_equal(line.get_ydata(), values),
+                  f"Plot data mismatch: {name}")
+            axis.set_title(f"{name} ({'sensor X_s' if field == 'x' else 'condition W'}) — {length} sampled points")
+            axis.set_xlabel("Original row position within flight (sampling stride 10)")
+            axis.set_ylabel("Train Min–Max value")
+            axis.grid(alpha=0.25)
+        axis = axes[-1]
+        line, = axis.plot(reference.cycle.to_numpy(), reference.hi_gt.to_numpy(),
+                          marker=".", markersize=4, linewidth=1.2, label="Reference HI (ground truth)")
+        check(np.array_equal(line.get_xdata(), reference.cycle.to_numpy())
+              and np.array_equal(line.get_ydata(), reference.hi_gt.to_numpy()), "HI plot data mismatch")
+        axis.axvline(cycle, color="tab:orange", linestyle="--", label=f"Selected flight: cycle {cycle}")
+        axis.set_title(f"Full unit {unit} reference HI — {len(reference)} flights")
+        axis.set_xlabel("Flight cycle")
+        axis.set_ylabel("Reference HI")
+        axis.grid(alpha=0.25)
+        axis.legend()
+        output = Path(config["output"]["root"]) / "data_inspection" / f"{split}_unit_{unit}_cycle_{cycle}.png"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=160)
+    finally:
+        plt.close(figure)
+    print(f"Flight: split={split}, unit={unit}, cycle={cycle}, points={length}, parameters={parameters}")
+    print(f"Reference HI: {len(reference)} flights, cycles {expected_cycles[0]}..{expected_cycles[-1]}")
+    print(f"Plot saved: {output}")
+    print("PASS: T1 data plot (normalized flight parameters and full reference HI)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=["data"])
+    parser.add_argument("--task", required=True, choices=["data", "data-plot"])
     parser.add_argument("--config", required=True)
+    parser.add_argument("--split", choices=["dev", "test"])
+    parser.add_argument("--unit", type=int)
+    parser.add_argument("--cycle", type=int)
+    parser.add_argument("--parameters", nargs="+", help="X_s/W variable names to plot")
     args = parser.parse_args()
-    verify_data(load_config(args.config))
+    config = load_config(args.config)
+    if args.task == "data":
+        verify_data(config)
+    else:
+        if any(value is None for value in (args.split, args.unit, args.cycle, args.parameters)):
+            parser.error("data-plot requires --split, --unit, --cycle and --parameters")
+        plot_data(config, args.split, args.unit, args.cycle, args.parameters)
 
 
 if __name__ == "__main__":

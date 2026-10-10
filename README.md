@@ -9,7 +9,7 @@
 | 任务 | 状态 | 验证摘要 | 用户确认记录 |
 |---|---|---|---|
 | T0 初始化 | 已验收 | 依赖、路径及忽略规则通过；commit b98f60d | 用户回复“开始T1”，确认继续 |
-| T1 数据管线 | 已完成，待验收 | 真实数据全量索引、归一化、mask、HI 关联检查通过；重复预处理一致 | 用户已授权执行；已确认归一化口径；待验收 |
+| T1 数据管线 | 已完成，补充绘图后待验收 | 全量数据验证通过；data-plot 已生成真实 flight 参数与完整 unit HI 曲线 | 用户已要求补充绘图，并确认 matplotlib 依赖；待验收 |
 | T2 模型与损失 | 未开始 | 未验证前向、掩码或损失 | 设计与数值已批准；待 T1 验收 |
 | T3 表示学习 | 未开始 | 未执行 smoke 或正式训练 | 设计与预算已批准；待 T2 验收 |
 | T4 排序学习 | 未开始 | 未验证冻结、采样或推理 | 设计与预算已批准；待 T3 验收 |
@@ -39,7 +39,7 @@ git rev-parse HEAD
 提交后 status 无输出，log 和 rev-parse 显示本地提交。
 路径检查仅验证文件存在，不代表 T1 数据验证通过。
 
-requirements.txt 列出 T0 必需依赖，不锁定参考仓库的旧环境。
+requirements.txt 列出当前实际使用的依赖，不锁定参考仓库的旧环境。
 后续任务仅在实际需要时经确认增加依赖。
 
 2026-10-10 实测：Python 3.11.15，PyTorch 2.5.1+cu121，NumPy 2.4.6，
@@ -140,3 +140,36 @@ HI 表为 pandas fixed HDF 格式，直接由已有 h5py 读取数值块，不�
 [预处理 Notebook](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/01_data_preprocess.ipynb)、
 [采样函数](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/pre_process_utils.py)。
 仅沿用已确认的原始 dev/test 与完整 flight 路径。
+
+## T1 曲线查看
+
+用户要求在 verify.py 补充绘图任务，并回复“+同意”确认新增 matplotlib 依赖。
+当前环境 matplotlib 3.10.9，绘图使用 Agg 后端输出 PNG，无需图形桌面。
+绘制某一 flight 的指定 X_s/W 参数，以及该 unit 全部周期的参考 HI：
+
+```bash
+python verify.py --task data-plot --config config.yaml --split dev --unit 1 --cycle 1 --parameters T24 T30 Nf alt
+```
+
+预期退出 0，生成 `outputs/data_inspection/dev_unit_1_cycle_1.png`，
+显示 568 个采样点的四条参数曲线和 unit 1 全部 72 个周期的 HI 曲线。
+每个参数独立子图，纵轴为训练 Min–Max 归一化值，横轴为 flight 内的原始行位置，
+保持每 10 点取 1 点的已确认采样口径；横轴不表示秒。
+HI 是参考表的 ground truth，未经重新缩放或平滑，图中虚线标注所选 flight 周期。
+模型预测 HI 尚未实现。
+
+参数名可选：`T24 T30 T48 T50 P15 P2 P21 P24 Ps30 P40 P50 Nf Nc Wf`
+（X_s）或 `alt Mach TRA T2`（W）。必须显式指定 split/unit/cycle/parameters，
+不存在的 flight、未知或重复参数、缺失必需参数均报错并返回非零退出码。
+相同 split/unit/cycle 组合再次执行会覆盖该查看图，PNG 被 Git 忽略。
+
+实际验证还运行：
+
+```bash
+python verify.py --task data-plot --config config.yaml --split test --unit 10 --cycle 66 --parameters T48 Wf Mach
+```
+
+退出 0，生成 `outputs/data_inspection/test_unit_10_cycle_66.png`，含 1251 个 flight 采样点和
+unit 10 全部 66 个周期的参考 HI。绘图时检查曲线点数、坐标和值与输入数据一致；
+已查看 dev 示例 PNG，标题、坐标和完整 HI 显示正常。`--parameters UNKNOWN` 实测退出码 1。
+原有 `--task data` 已重验通过。未启动 T2 或模型训练。

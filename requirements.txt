@@ -1,4 +1,4 @@
-# Dependencies required by the T0 environment check.
+# Runtime and verification dependencies.
 torch
 numpy
 pandas
@@ -6,3 +6,4 @@ h5py
 scipy
 scikit-learn
 PyYAML
+matplotlib
