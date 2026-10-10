@@ -110,6 +110,139 @@ def verify_data(config):
     print("PASS: T1 real DS03 data verification (not smoke or training)")
 
 
+def verify_model(config):
+    from losses import (diagonal_gaussian_kl, head_l2, hi_loss, order_loss,
+                        reconstruction_loss, representation_loss)
+    from model import HIHead, OCALD, time_positions
+
+    torch.manual_seed(config["training"]["seed"])
+    if config["training"]["device"] != "auto":
+        raise ValueError("Unapproved device selection; expected auto")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        torch.set_num_threads(1)  # Small validation batches avoid CPU thread overhead.
+    data = load_processed(config)
+    dataset = FlightDataset(data, "dev")
+    longest = max(range(len(dataset)), key=lambda index: len(dataset[index]["x"]))
+    indices = list(dict.fromkeys([0, 1, longest]))
+    batch = {key: value.to(device) for key, value in collate_fn([dataset[i] for i in indices]).items()}
+    x, w, mask = batch["x"], batch["w"], batch["mask"]
+    model = OCALD(config).to(device)
+    output = model(x, w, mask)
+    for key in ("mu_i", "logvar_i", "mu_c", "logvar_c", "prior_mu_c", "prior_logvar_c"):
+        check(output[key].shape == (len(indices), 8) and torch.isfinite(output[key]).all(), f"Invalid {key}")
+    check(output["x_hat"].shape == x.shape and torch.isfinite(output["x_hat"]).all(), "Invalid reconstruction")
+    losses = representation_loss(x, mask, output, config["training"]["representation"]["sigma_x_squared"])
+    check(all(torch.isfinite(value) for value in losses.values()), "Nonfinite real-batch loss")
+    losses["loss"].backward()
+    for name in ("sensor_encoder", "conditional_prior", "decoder"):
+        parameters = list(getattr(model, name).parameters())
+        check(all(p.grad is not None and torch.isfinite(p.grad).all() for p in parameters), f"Missing/nonfinite gradients: {name}")
+        check(sum(p.grad.abs().sum().item() for p in parameters) > 0, f"Zero gradient: {name}")
+    check(all(p.grad is None for p in model.hi_head.parameters()), "Stage 1 objective reached HI head")
+    print(f"Device: {device}; real dev batch indices={indices}, lengths={mask.sum(1).tolist()}, X={tuple(x.shape)}, W={tuple(w.shape)}")
+    print("Parameter counts:", {name: sum(p.numel() for p in getattr(model, name).parameters())
+                                for name in ("sensor_encoder", "conditional_prior", "decoder", "hi_head")})
+    print("Total parameters:", sum(p.numel() for p in model.parameters()))
+    print("Random-initialization loss:", {key: value.item() for key, value in losses.items()})
+
+    # Compare to an independent PyTorch distribution implementation in float64.
+    mu_q, logvar_q, mu_p, logvar_p = [torch.randn(5, 8, dtype=torch.float64, device=device) for _ in range(4)]
+    actual = diagonal_gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)
+    q = torch.distributions.Normal(mu_q, (0.5 * logvar_q).exp())
+    p = torch.distributions.Normal(mu_p, (0.5 * logvar_p).exp())
+    expected = torch.distributions.kl_divergence(q, p).sum(-1)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-10)
+    torch.testing.assert_close(diagonal_gaussian_kl(mu_q, logvar_q, mu_q, logvar_q), torch.zeros_like(actual), rtol=0, atol=1e-12)
+    print(f"KL: PyTorch agreement, max absolute error={(actual - expected).abs().max().item():.3g}; q=p gives zero")
+
+    # Hand calculation: valid residual=1, reconstruction=[2,1], KL_I=[0.5,2].
+    toy_mask = torch.tensor([[True, True], [True, False]], device=device)
+    toy_x = torch.ones(2, 2, 2, device=device).masked_fill(~toy_mask[:, :, None], float("nan"))
+    zero = torch.zeros(2, 1, device=device)
+    toy_output = {"x_hat": torch.zeros_like(toy_x), "mu_i": torch.tensor([[1.], [2.]], device=device),
+                  "logvar_i": zero, "mu_c": zero, "logvar_c": zero, "prior_mu_c": zero, "prior_logvar_c": zero}
+    torch.testing.assert_close(reconstruction_loss(toy_x, toy_output["x_hat"], toy_mask, 1.0),
+                               torch.tensor([2., 1.], device=device))
+    torch.testing.assert_close(representation_loss(toy_x, toy_mask, toy_output, 1.0)["loss"],
+                               torch.tensor(2.75, device=device))
+    print("ELBO: hand-calculated flight-summed reconstruction and flight-averaged total=2.75 verified")
+
+    model.eval()
+    with torch.no_grad():
+        posterior = model.encode(x, mask)
+        prior = model.conditional_prior(w, mask)
+        hi = model.predict_hi(x, mask)
+        torch.testing.assert_close(hi, torch.sigmoid(-model.hi_head(posterior[0])), rtol=0, atol=0)
+        torch.testing.assert_close(hi, model.predict_hi(x, mask), rtol=0, atol=0)
+        check(hi.shape == (len(indices),) and ((hi > 0) & (hi < 1)).all(), "Invalid deterministic HI")
+        changed_x = x.masked_fill(~mask[:, :, None], float("nan"))
+        changed_w = w.masked_fill(~mask[:, :, None], float("nan"))
+        padded_mask = torch.nn.functional.pad(mask, (0, 11), value=False)
+        padded_x = torch.nn.functional.pad(changed_x, (0, 0, 0, 11), value=float("nan"))
+        padded_w = torch.nn.functional.pad(changed_w, (0, 0, 0, 11), value=float("nan"))
+        for candidate_x, candidate_w, candidate_mask in ((changed_x, changed_w, mask), (padded_x, padded_w, padded_mask)):
+            for base, changed in zip(posterior, model.encode(candidate_x, candidate_mask)):
+                torch.testing.assert_close(base, changed, rtol=1e-6, atol=1e-6)
+            for base, changed in zip(prior, model.conditional_prior(candidate_w, candidate_mask)):
+                torch.testing.assert_close(base, changed, rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(hi, model.predict_hi(candidate_x, candidate_mask), rtol=1e-6, atol=1e-6)
+            base_reconstruction = model.decode(posterior[0], posterior[2], time_positions(mask))
+            changed_reconstruction = model.decode(posterior[0], posterior[2], time_positions(candidate_mask))[:, :mask.shape[1]]
+            torch.testing.assert_close(base_reconstruction[mask], changed_reconstruction[mask], rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(reconstruction_loss(x, base_reconstruction, mask, 1.0),
+                                       reconstruction_loss(candidate_x, model.decode(posterior[0], posterior[2], time_positions(candidate_mask)), candidate_mask, 1.0))
+        for j, index in enumerate(indices):
+            single = {key: value.to(device) for key, value in collate_fn([dataset[index]]).items()}
+            for base, unpadded in zip(posterior, model.encode(single["x"], single["mask"])):
+                torch.testing.assert_close(base[j:j + 1], unpadded, rtol=1e-6, atol=1e-6)
+        positions = time_positions(mask)
+        torch.testing.assert_close(positions[:, 0], torch.zeros(len(indices), device=device))
+        torch.testing.assert_close(positions.gather(1, (mask.sum(1) - 1)[:, None]).squeeze(1), torch.ones(len(indices), device=device))
+        torch.testing.assert_close(time_positions(torch.tensor([[True, False]], device=device)), torch.zeros(1, 2, device=device))
+
+    # Forward hooks establish that altered W changes only the prior path. Fix
+    # sampling seed so a stochastic latent draw cannot obscure the comparison.
+    seen = []
+    hook = model.sensor_encoder.register_forward_hook(lambda module, inputs, result: seen.append(result))
+    try:
+        with torch.no_grad():
+            torch.manual_seed(42)
+            base = model(x, w, mask)
+            torch.manual_seed(42)
+            altered = model(x, w + 0.75, mask)
+        for first, second in zip(seen[0], seen[1]):
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        check(not torch.equal(base["prior_mu_c"], altered["prior_mu_c"]), "W did not reach conditional prior")
+        torch.testing.assert_close(base["x_hat"], altered["x_hat"], rtol=0, atol=0)
+        with torch.no_grad():
+            torch.testing.assert_close(hi, model.predict_hi(x, mask), rtol=0, atol=0)
+    finally:
+        hook.remove()
+    print("Mask/time: padding replacement/extension, single-flight comparison and length-one position verified")
+    print("Information paths: W affects prior; posterior/decoder/HI independence and deterministic sigmoid(-r) verified")
+
+    early = torch.tensor([-1., 0.], device=device, requires_grad=True)
+    late = torch.tensor([1., 2.], device=device, requires_grad=True)
+    kappa = config["training"]["hi"]["kappa"]
+    correct, reversed_loss = order_loss(early, late, kappa), order_loss(late, early, kappa)
+    check(correct < reversed_loss, "Reversed order has lower loss")
+    correct.backward()
+    check((early.grad > 0).all() and (late.grad < 0).all(), "Wrong ordering gradient direction")
+    head = HIHead(8, 16).to(device)
+    with torch.no_grad():
+        for name, parameter in head.named_parameters():
+            parameter.fill_(1 if name.endswith("bias") else 2)
+    # 144 weights of value 2 plus 17 biases of value 1: 144*4+17=593.
+    torch.testing.assert_close(head_l2(head), torch.tensor(593., device=device))
+    ordinal = hi_loss(early.detach(), late.detach(), head, kappa, config["training"]["hi"]["l2_coefficient"])
+    torch.testing.assert_close(ordinal["loss"], correct.detach() + 0.0001 * 593)
+    ordinal["loss"].backward()
+    check(all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters()), "Missing head L2 gradients")
+    print(f"Order: correct={correct.item():.6f}, reversed={reversed_loss.item():.6f}; gradient direction and bias-inclusive L2 verified")
+    print("PASS: T2 model and loss verification (real forward/backward plus analytical checks; no training)")
+
+
 def plot_data(config, split, unit, cycle, parameters):
     """Plot one sampled flight and the unit's full reference HI trajectory."""
     import matplotlib
@@ -178,7 +311,7 @@ def plot_data(config, split, unit, cycle, parameters):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=["data", "data-plot"])
+    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model"])
     parser.add_argument("--config", required=True)
     parser.add_argument("--split", choices=["dev", "test"])
     parser.add_argument("--unit", type=int)
@@ -188,6 +321,8 @@ def main():
     config = load_config(args.config)
     if args.task == "data":
         verify_data(config)
+    elif args.task == "model":
+        verify_model(config)
     else:
         if any(value is None for value in (args.split, args.unit, args.cycle, args.parameters)):
             parser.error("data-plot requires --split, --unit, --cycle and --parameters")

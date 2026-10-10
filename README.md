@@ -9,8 +9,8 @@
 | 任务 | 状态 | 验证摘要 | 用户确认记录 |
 |---|---|---|---|
 | T0 初始化 | 已验收 | 依赖、路径及忽略规则通过；commit b98f60d | 用户回复“开始T1”，确认继续 |
-| T1 数据管线 | 已完成，补充绘图后待验收 | 全量数据验证通过；data-plot 已生成真实 flight 参数与完整 unit HI 曲线 | 用户已要求补充绘图，并确认 matplotlib 依赖；待验收 |
-| T2 模型与损失 | 未开始 | 未验证前向、掩码或损失 | 设计与数值已批准；待 T1 验收 |
+| T1 数据管线 | 已验收 | 全量数据验证、data-plot 通过；commit 0c4b4aa | 用户回复“确认通过，开始 T2” |
+| T2 模型与损失 | 已完成，待验收 | 真实前向/反向、解析损失、padding 和信息路径检查通过 | 用户已授权执行；待验收 |
 | T3 表示学习 | 未开始 | 未执行 smoke 或正式训练 | 设计与预算已批准；待 T2 验收 |
 | T4 排序学习 | 未开始 | 未验证冻结、采样或推理 | 设计与预算已批准；待 T3 验收 |
 | T5 评价 | 未开始 | 未计算评价指标 | 待 T4 验收 |
@@ -18,6 +18,7 @@
 T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
 并将用户提供的两份规则与方案文件纳入首次本地提交。Python 实现文件按后续任务创建。
 T1 新增 data.py 与 verify.py 的数据验证入口，更新数据配置和本文记录。
+T2 新增 model.py、losses.py，并扩展 verify.py 的模型机制检查。
 
 ## 环境与 T0 验证
 
@@ -83,7 +84,7 @@ Stage 2 冻结表示模块，`h=sigmoid(-g(mu_I))`。
 HI/RUL 仅作评价；归一化与全局 HI Min–Max 仅由训练数据或训练预测拟合。
 结构不保证表示解耦或物理尺度标定，不使用测试标签选模或早停。
 
-当前已创建数据管线及数据验证入口，尚未创建模型、训练或评价指标实现，未运行任何训练。
+当前已创建数据管线、模型、损失和验证入口，尚未创建训练或评价指标实现，未运行任何训练。
 本项目仅使用本地 Git，不配置远端，不 push。原始数据、缓存、权重、outputs 和凭据不提交。
 
 ## T1 运行与真实数据验证
@@ -156,7 +157,7 @@ python verify.py --task data-plot --config config.yaml --split dev --unit 1 --cy
 每个参数独立子图，纵轴为训练 Min–Max 归一化值，横轴为 flight 内的原始行位置，
 保持每 10 点取 1 点的已确认采样口径；横轴不表示秒。
 HI 是参考表的 ground truth，未经重新缩放或平滑，图中虚线标注所选 flight 周期。
-模型预测 HI 尚未实现。
+此查看任务绘制参考 HI；训练后的模型预测曲线仍待后续任务实现。
 
 参数名可选：`T24 T30 T48 T50 P15 P2 P21 P24 Ps30 P40 P50 Nf Nc Wf`
 （X_s）或 `alt Mach TRA T2`（W）。必须显式指定 split/unit/cycle/parameters，
@@ -173,3 +174,60 @@ python verify.py --task data-plot --config config.yaml --split test --unit 10 --
 unit 10 全部 66 个周期的参考 HI。绘图时检查曲线点数、坐标和值与输入数据一致；
 已查看 dev 示例 PNG，标题、坐标和完整 HI 显示正常。`--parameters UNKNOWN` 实测退出码 1。
 原有 `--task data` 已重验通过。未启动 T2 或模型训练。
+
+## T2 模型与损失验证
+
+```bash
+python verify.py --task model --config config.yaml
+```
+
+预期退出 0，末行显示
+`PASS: T2 model and loss verification (real forward/backward plus analytical checks; no training)`。
+需要 T1 的 `data/processed/ds03.pt`；本任务不加载 HI/RUL 参考文件、不执行优化器更新或保存权重。
+缺少数据或机制检查失败会返回非零退出码。
+
+model.py 使用已批准的单层单向 GRU、四个后验线性头、两个条件先验线性头、时间条件 MLP
+和 HI 头；全部采用 PyTorch 默认初始化。GRU 用真实长度打包序列，并取最后有效隐藏状态。
+mask 必须是非空有效前缀和尾部 padding；时间位置按真实长度归一化，长度为 1 时为 0。
+没有增加 dropout、log variance 裁剪、额外网络或损失。
+
+```python
+from model import OCALD, time_positions
+model = OCALD(config)
+mu_i, logvar_i, mu_c, logvar_c = model.encode(x, mask)
+prior_mu_c, prior_logvar_c = model.conditional_prior(w, mask)
+x_hat = model.decode(mu_i, mu_c, time_positions(mask, dtype=x.dtype))
+hi = model.predict_hi(x, mask)  # sigmoid(-g(mu_i))，不读 W/cycle/标签
+output = model(x, w, mask)     # 重参数化后验采样，供 Stage 1 目标使用
+```
+
+losses.py 提供逐 flight 有效元素求和的固定方差重构项、解析对角高斯 KL、按 flight 平均的
+标准负 ELBO、早晚分数 softplus 排序项，以及包含头部权重和偏置的显式 L2。
+重构在有效元素上运算，padding 不贡献损失；两个 KL 系数均为 1。
+
+实际 CPU 验证：dev flight 索引 `[0, 1, 427]`，长度 `[568, 312, 2029]`；
+X 形状 `(3, 2029, 14)`、W 形状 `(3, 2029, 4)`；未截断完整 flight。
+为避免小验证批次的 CPU 线程开销，验证进程设单线程；未更改训练配置。
+
+| 模块 | 参数量 |
+|---|---|
+| SensorEncoder | 17,440 |
+| ConditionalPrior | 4,176 |
+| Decoder | 6,222 |
+| HIHead | 161 |
+| 总计 | 27,999 |
+
+随机初始化真实批次分项：重构 `1851.647461`，KL_I `0.084586`，KL_C `0.268159`，
+总负 ELBO `1852.000366`。这是机制检查数值，不是训练、解耦或 HI 性能结果。
+PyTorch float64 KL 参考最大绝对误差 `1.42e-14`，q=p 时为零。
+手算小样本的重构为 `[2,1]`、KL_I 为 `[0.5,2]`，按 flight 平均的总目标为 `2.75`，检查通过。
+
+验证还覆盖：替换 padding 为 NaN、增加 11 个 padding 时间步、单条无 padding 与批次对比，
+有效后验/先验/解码/HI 与重构损失不变；时间位置首末为 0/1，单点 flight 为 0；
+W 改变条件先验，但不改变后验、固定后验采样的重构或 HI；HI 用确定性 mu_I 与 sigmoid(-r)。
+真实负 ELBO 反向能到达编码器、先验和解码器，HI 头不受该目标影响。
+正确排序损失 `0.126928`，反向排序 `2.126928`，梯度方向正确；头参数的手算 L2
+`144×2² + 17×1² = 593` 检查包含权重与偏置。
+
+仅验证了 CPU，未验证 CUDA；未进行 smoke、正式训练、冻结训练或 checkpoint 保存/加载，
+后两项留到对应训练任务。T2 验收后才启动 T3。
