@@ -243,6 +243,76 @@ def verify_model(config):
     print("PASS: T2 model and loss verification (real forward/backward plus analytical checks; no training)")
 
 
+def verify_representation(config, path):
+    import csv
+    from train import (REPRESENTATION_MODULES, load_representation,
+                       representation_state, validate_representation_config)
+    from model import OCALD
+
+    validate_representation_config(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        torch.set_num_threads(1)
+    loaded, checkpoint = load_representation(path, device)
+    check(checkpoint["config"] == config, "Checkpoint configuration differs from supplied config")
+    check(checkpoint["mode"] in ("smoke", "formal"), "Unknown checkpoint mode")
+    expected_epochs = config["smoke"]["representation_epochs"] if checkpoint["mode"] == "smoke" else config["training"]["representation"]["epochs"]
+    check(checkpoint["epoch"] == expected_epochs, "Checkpoint is not from the last approved epoch")
+    processed = load_processed(config)
+    dataset = FlightDataset(processed, "dev")
+    check(checkpoint["training_flights_total"] == len(dataset), "Training flight count mismatch")
+    indices = checkpoint["training_indices"]
+    expected_indices = list(range(len(dataset)))
+    if checkpoint["mode"] == "smoke":
+        expected_indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(config["training"]["seed"]))[:min(32, len(dataset))].tolist()
+    check(indices == expected_indices, "Training subset does not follow the approved selection")
+    for field in ("x", "w"):
+        for key in ("min", "max"):
+            check(torch.equal(checkpoint["normalization"][field][key], processed["normalization"][field][key]),
+                  "Checkpoint normalization differs from full training normalization")
+    check(checkpoint["columns"] == processed["columns"], "Checkpoint column names differ")
+    torch.manual_seed(config["training"]["seed"])
+    initial = representation_state(OCALD(config))
+    state = checkpoint["state_dict"]
+    check(all(torch.isfinite(value).all() for value in state.values()), "Nonfinite checkpoint weights")
+    changed = {name: sum(not torch.equal(initial[key], state[key]) for key in state if key.startswith(name + "."))
+               for name in REPRESENTATION_MODULES}
+    check(all(count > 0 for count in changed.values()), "An entire representation module did not update")
+    check(checkpoint["hi_head_unchanged"] is True and not any(key.startswith("hi_head.") for key in state),
+          "Representation checkpoint includes trained HI head")
+    probe_indices = checkpoint["verification"]["indices"]
+    check(probe_indices == indices[:3], "Unexpected checkpoint verification flights")
+    probe = collate_fn([dataset[index] for index in probe_indices])
+    with torch.no_grad():
+        posterior = loaded.encode(probe["x"].to(device), probe["mask"].to(device))
+        repeated = loaded.encode(probe["x"].to(device), probe["mask"].to(device))
+    errors = []
+    saved_posterior = checkpoint["verification"]["posterior_before_save"]
+    check(len(saved_posterior) == 4 and all(torch.isfinite(value).all() for value in saved_posterior),
+          "Missing/nonfinite saved posterior outputs")
+    for expected, actual, repeat in zip(saved_posterior, posterior, repeated):
+        torch.testing.assert_close(expected.to(device), actual, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(actual, repeat, rtol=0, atol=0)
+        errors.append((expected.to(device) - actual).abs().max().item())
+    # Log means are weighted by flight count, and the final checkpoint matches
+    # the final row, without choosing an epoch using evaluation labels.
+    with Path(path).with_name("losses.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    check(len(rows) == expected_epochs, "Incomplete epoch log")
+    for epoch, row in enumerate(rows, 1):
+        check(int(row["epoch"]) == epoch and int(row["flights"]) == len(indices)
+              and row["stage"] == "representation" and row["mode"] == checkpoint["mode"], "Invalid epoch metadata")
+        values = [float(row[key]) for key in ("loss", "reconstruction", "kl_i", "kl_c")]
+        check(np.isfinite(values).all(), "Nonfinite log values")
+        check(np.isclose(values[0], sum(values[1:]), rtol=1e-6, atol=1e-5), "Logged ELBO does not equal component sum")
+    print(f"Stage 1 checkpoint: mode={checkpoint['mode']}, epoch={checkpoint['epoch']}, device={device}, flights={len(indices)}/{len(dataset)}")
+    print("Updated tensors compared with seeded initialization:", changed)
+    print("Posterior save/load maximum absolute errors (mu_I, logvar_I, mu_C, logvar_C):", errors)
+    print("Last epoch loss:", {key: float(rows[-1][key]) for key in ("loss", "reconstruction", "kl_i", "kl_c")})
+    print("Full-train normalization, finite logs, unchanged/excluded HI head and independent loader verified")
+    print("PASS: T3 representation training and checkpoint verification")
+
+
 def plot_data(config, split, unit, cycle, parameters):
     """Plot one sampled flight and the unit's full reference HI trajectory."""
     import matplotlib
@@ -311,18 +381,23 @@ def plot_data(config, split, unit, cycle, parameters):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model"])
+    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation"])
     parser.add_argument("--config", required=True)
     parser.add_argument("--split", choices=["dev", "test"])
     parser.add_argument("--unit", type=int)
     parser.add_argument("--cycle", type=int)
     parser.add_argument("--parameters", nargs="+", help="X_s/W variable names to plot")
+    parser.add_argument("--checkpoint")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.task == "data":
         verify_data(config)
     elif args.task == "model":
         verify_model(config)
+    elif args.task == "representation":
+        if args.checkpoint is None:
+            parser.error("representation requires --checkpoint")
+        verify_representation(config, args.checkpoint)
     else:
         if any(value is None for value in (args.split, args.unit, args.cycle, args.parameters)):
             parser.error("data-plot requires --split, --unit, --cycle and --parameters")

@@ -10,8 +10,8 @@
 |---|---|---|---|
 | T0 初始化 | 已验收 | 依赖、路径及忽略规则通过；commit b98f60d | 用户回复“开始T1”，确认继续 |
 | T1 数据管线 | 已验收 | 全量数据验证、data-plot 通过；commit 0c4b4aa | 用户回复“确认通过，开始 T2” |
-| T2 模型与损失 | 已完成，待验收 | 真实前向/反向、解析损失、padding 和信息路径检查通过 | 用户已授权执行；待验收 |
-| T3 表示学习 | 未开始 | 未执行 smoke 或正式训练 | 设计与预算已批准；待 T2 验收 |
+| T2 模型与损失 | 已验收 | 真实前向/反向及机制验证通过；commit 40289d6 | 用户回复“开始 T3”，确认继续 |
+| T3 表示学习 | 实现及 smoke 完成，待验收 | 32 条真实 flight、3 epochs；更新、日志、checkpoint 独立加载通过；正式训练未运行 | 用户已授权执行；待验收 |
 | T4 排序学习 | 未开始 | 未验证冻结、采样或推理 | 设计与预算已批准；待 T3 验收 |
 | T5 评价 | 未开始 | 未计算评价指标 | 待 T4 验收 |
 
@@ -19,6 +19,7 @@ T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
 并将用户提供的两份规则与方案文件纳入首次本地提交。Python 实现文件按后续任务创建。
 T1 新增 data.py 与 verify.py 的数据验证入口，更新数据配置和本文记录。
 T2 新增 model.py、losses.py，并扩展 verify.py 的模型机制检查。
+T3 新增 train.py 的 Stage 1 入口与 checkpoint 加载，扩展 verify.py 的表示训练检查。
 
 ## 环境与 T0 验证
 
@@ -84,7 +85,8 @@ Stage 2 冻结表示模块，`h=sigmoid(-g(mu_I))`。
 HI/RUL 仅作评价；归一化与全局 HI Min–Max 仅由训练数据或训练预测拟合。
 结构不保证表示解耦或物理尺度标定，不使用测试标签选模或早停。
 
-当前已创建数据管线、模型、损失和验证入口，尚未创建训练或评价指标实现，未运行任何训练。
+当前已创建数据管线、模型、损失、Stage 1 训练和验证入口，已完成 Stage 1 smoke。
+尚未实现 Stage 2 训练或评价指标，尚未运行正式训练。
 本项目仅使用本地 Git，不配置远端，不 push。原始数据、缓存、权重、outputs 和凭据不提交。
 
 ## T1 运行与真实数据验证
@@ -231,3 +233,68 @@ W 改变条件先验，但不改变后验、固定后验采样的重构或 HI；
 
 仅验证了 CPU，未验证 CUDA；未进行 smoke、正式训练、冻结训练或 checkpoint 保存/加载，
 后两项留到对应训练任务。T2 验收后才启动 T3。
+
+## T3 Stage 1 训练与 checkpoint
+
+按已批准 smoke 预算运行：
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python train.py --config config.yaml --stage representation --smoke
+```
+
+CPU 环境设置上述线程数以减少小 GRU 批次的线程开销；不改变模型、batch、损失或训练预算。
+实际设备按 CUDA 可用性选择，命令会报告设备、线程数、flight 数、模式与输出目录。
+smoke 固定种子 42 抽取最多 32 个真实 dev flight，保持完整长度，归一化继续使用全部原始 dev
+已拟合参数。每个 epoch 都覆盖选中 flight，训练批次打乱，日志按实际 flight 数加权平均。
+
+每次运行创建新的时间戳目录 `outputs/representation_smoke_<UTC时间>/`；正式运行目录使用
+`representation_formal_<UTC时间>`，不复用或覆盖已有目录。输出为 config.yaml、losses.csv 和
+最后一个 epoch 的 representation.pt。CSV 独立记录 reconstruction、kl_i、kl_c 和总损失。
+
+实际输出目录：`outputs/representation_smoke_20261010T084030540551Z/`。
+验证这次产物：
+
+```bash
+python verify.py --task representation --config config.yaml --checkpoint outputs/representation_smoke_20261010T084030540551Z/representation.pt
+```
+
+预期退出 0，末行显示 `PASS: T3 representation training and checkpoint verification`。
+重新训练时，将 checkpoint 路径替换为新命令实际打印的目录。
+
+实际 CPU smoke：batch=16，32/663 条训练 flight，3 epochs，未加载 HI/RUL。
+
+| epoch | 总损失 | 重构 | KL_I | KL_C |
+|---|---|---|---|---|
+| 1 | 1790.096497 | 1789.757690 | 0.080596 | 0.258116 |
+| 2 | 1537.474365 | 1537.164368 | 0.084760 | 0.225291 |
+| 3 | 1384.299072 | 1383.980225 | 0.114115 | 0.204688 |
+
+三个表示模块更新的参数张量数分别为 12、8、6。HI 头未进入优化器、未更新，也未保存到表示权重中。
+保存前后四个确定性后验输出（mu_I/logvar_I/mu_C/logvar_C）的最大绝对误差均为 0。
+验证同时核对训练 subset、最后一轮 epoch、全训练归一化参数、列名和有限日志。
+loss 不要求每个 KL 都下降，短程 loss 变化不能作为解耦或健康表征有效性的证据。
+
+checkpoint 保存表示权重、必要配置、归一化、列名、阶段和 smoke/formal 信息；另保存
+训练索引和三条 flight 的保存前后验，供本任务验证。没有保存 HI/RUL 标签。
+`load_representation` 只需 checkpoint 即可初始化和加载表示模块：
+
+```python
+import torch
+from train import load_representation
+model, checkpoint = load_representation(checkpoint_path, torch.device('cpu'))
+normalization = checkpoint['normalization']
+```
+
+加载后 model 为 eval 模式；该表示 checkpoint 中的 HI 头没有受训。
+已在禁止 HDF5 读取的检查中独立加载并前向通过，不依赖原始数据文件或隐含脚本。
+错误阶段 checkpoint 被拒绝，验证 CLI 实测退出码 1；编译和 Git diff 检查通过。
+
+正式 Stage 1 入口已实现，沿用批准的 100 epochs、Adam 默认其余参数、lr=0.001、
+weight_decay=0、batch=16、sigma_x²=1、两项 KL 权重 1 和梯度范数上限 5：
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python train.py --config config.yaml --stage representation
+```
+
+本次只完成 smoke，**正式 100 epochs 未运行**，CUDA 未验证，Stage 2 未实现或启动。
+正式评价前仍需完成正式 Stage 1→Stage 2；本次 smoke 结果仅作为训练与加载流程验证。
