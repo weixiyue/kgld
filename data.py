@@ -227,6 +227,33 @@ def read_reference(path, flights):
     return frame
 
 
+def read_rul(path, split, flights):
+    """Evaluation-only RUL; require the observed constant-per-flight labels."""
+    if split not in ("dev", "test"):
+        raise ValueError("RUL split must be dev or test")
+    records = []
+    with h5py.File(path, "r") as hdf:
+        names = variable_names(hdf["A_var"])
+        auxiliary = hdf[f"A_{split}"]
+        labels = hdf[f"Y_{split}"]
+        if labels.shape != (auxiliary.shape[0], 1):
+            raise ValueError("RUL row/column dimensions differ from raw data")
+        for flight in flights:
+            left, right = flight["raw_start"], flight["raw_stop"]
+            unit = integer_ids(auxiliary[left:right, names.index("unit")], "RUL unit")
+            cycle = integer_ids(auxiliary[left:right, names.index("cycle")], "RUL cycle")
+            if not (unit == flight["unit"]).all() or not (cycle == flight["cycle"]).all():
+                raise ValueError("RUL raw rows do not match flight keys")
+            values = labels[left:right, 0]
+            if len(values) == 0 or not np.isfinite(values).all() or (values < 0).any() or not (values == values[0]).all():
+                raise ValueError(f"Nonfinite/negative/nonconstant RUL: unit={flight['unit']}, cycle={flight['cycle']}")
+            records.append({"unit": flight["unit"], "cycle": flight["cycle"], "rul": float(values[0])})
+    result = pd.DataFrame(records)
+    if result.duplicated(["unit", "cycle"]).any():
+        raise ValueError("Duplicate RUL flight keys")
+    return result
+
+
 def print_summary(data):
     for split in ("dev", "test"):
         flights = data[split]

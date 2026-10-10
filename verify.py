@@ -429,6 +429,96 @@ def verify_hi(config, path):
     print("PASS: T4 HI training and independent inference verification")
 
 
+def verify_metrics(config):
+    from metrics import (evaluate_metrics, failure_consistency, mae, mape,
+                         monotonicity, spearman, transformed_mi)
+    from evaluate import attach_references, metric_report
+    import pandas as pd
+
+    np.testing.assert_allclose(mae(np.array([.5, .5, .3]), np.array([1., .5, 0.])), .8 / 3)
+    np.testing.assert_allclose(mape(np.array([.5, .5, .3]), np.array([1., .5, 0.])), 25.)
+    np.testing.assert_allclose(monotonicity(np.array([3., 3., 2., 1.])), 1.)
+    opposite = [spearman(np.arange(4.), np.arange(4.)), spearman(np.arange(4.)[::-1], np.arange(4.))]
+    np.testing.assert_allclose(abs(np.mean(opposite)), 0.)
+    p = np.array([.9, .75, .5, .25, .1, .95, .7, .6, .3, .05])
+    gt = p * .9
+    units = np.repeat([1, 2], 5)
+    cycles = np.tile(np.arange(1, 6), 2)
+    rul = np.tile(np.arange(4, -1, -1), 2)
+    report = evaluate_metrics(p, gt, units, cycles, rul, config["training"]["seed"])
+    # Expected values independently checked against the reference commit's
+    # metric functions; MI comparison fixes the otherwise unspecified seed.
+    expected = {"mae": .051, "mape": 100 / 9, "monotonicity": 1., "trend": 1.,
+                "failure_consistency": np.exp(-.025 / .85), "mi": .2012342319253067}
+    for key, value in expected.items():
+        np.testing.assert_allclose(report["overall"][key]["value"], value, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(failure_consistency([p[:5], p[5:]]), expected["failure_consistency"])
+    np.testing.assert_allclose(transformed_mi(p[:5], rul[:5], 42), transformed_mi(p[:5], rul[:5], 42), rtol=0, atol=0)
+    shuffled = np.random.default_rng(42).permutation(len(p))
+    check(evaluate_metrics(p[shuffled], gt[shuffled], units[shuffled], cycles[shuffled], rul[shuffled], 42) == report,
+          "Metric results depend on table row order rather than keyed cycle order")
+    prediction = pd.DataFrame({"unit": [1, 1], "cycle": [2, 1], "hi_raw": [.4, .7]})
+    hi = pd.DataFrame({"unit": [1, 1], "cycle": [1, 2], "hi_gt": [.9, .5]})
+    labels = pd.DataFrame({"unit": [1, 1], "cycle": [2, 1], "rul": [0, 1]})
+    aligned = attach_references(prediction, hi, labels)
+    check(aligned.cycle.tolist() == [1, 2] and aligned.hi_gt.tolist() == [.9, .5]
+          and aligned.hi_raw.tolist() == [.7, .4], "References were positionally joined")
+    try:
+        attach_references(prediction, hi.iloc[:1], labels)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Missing reference keys were accepted")
+    zero_scale_table = pd.DataFrame({"split": ["dev"] * 10 + ["test"] * 10,
+                                    "unit": np.tile(units, 2), "cycle": np.tile(cycles, 2),
+                                    "hi_raw": np.tile(p, 2), "hi_scaled": np.full(20, np.nan),
+                                    "hi_gt": np.tile(gt, 2), "rul": np.tile(rul, 2)})
+    zero_scale_checkpoint = {"mode": "smoke", "source_mode": "smoke", "epoch": 3, "source_epoch": 3,
+                             "config": config, "hi_minmax": {"min": .5, "max": .5, "count": 10, "fit_split": "dev"}}
+    zero_scale_report = metric_report(zero_scale_table, zero_scale_checkpoint)
+    check(all(not zero_scale_report["splits"][split]["scaled"]["available"]
+              and zero_scale_report["splits"][split]["raw"]["available"] for split in ("dev", "test")),
+          "Zero training HI range did not mark scaled evaluation unavailable")
+    print("PASS: non-degenerate T5 metrics and keyed associations; edge-case policy awaits confirmation")
+
+
+def verify_evaluation(config, run_dir):
+    import json
+    import pandas as pd
+    from evaluate import metric_report, plot_curves, predict_table
+    from train import scale_hi
+
+    run_dir = Path(run_dir)
+    table = pd.read_csv(run_dir / "predictions.csv", float_precision="round_trip")
+    with (run_dir / "metrics.json").open(encoding="utf-8") as stream:
+        report = json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"Invalid JSON constant: {value}")))
+    fresh, checkpoint = predict_table(config, run_dir / "ocald.pt")
+    check(set(table.columns) == {"split", "unit", "cycle", "hi_raw", "hi_scaled", "hi_gt", "rul"}, "Prediction columns differ")
+    keys = ["split", "unit", "cycle"]
+    check(not table.duplicated(keys).any(), "Duplicate prediction keys")
+    table = table.sort_values(keys).reset_index(drop=True)
+    fresh = fresh.sort_values(keys).reset_index(drop=True)
+    check(table[keys].equals(fresh[keys]) and len(table) == len(fresh), "CSV rows/keys differ from actual flights")
+    for field in ("hi_raw", "hi_scaled", "hi_gt", "rul"):
+        np.testing.assert_allclose(table[field], fresh[field], rtol=0, atol=0, equal_nan=True)
+    check(report == metric_report(table, checkpoint), "Exported metrics differ from CSV data")
+    if checkpoint["hi_minmax"]["min"] != checkpoint["hi_minmax"]["max"]:
+        expected = scale_hi(torch.tensor(table.hi_raw.to_numpy()), checkpoint["hi_minmax"]).numpy()
+        np.testing.assert_allclose(table.hi_scaled, expected, rtol=1e-6, atol=1e-7)
+    else:
+        check(table.hi_scaled.isna().all() and all(not report["splits"][split]["scaled"]["available"] for split in ("dev", "test")), "Zero range was silently scaled")
+    # A temporary re-render invokes the exact CSV/curve point checks.
+    plot_curves(table, report, "/tmp/ocald_t5_curve_verification.png")
+    image = run_dir / "hi_curves.png"
+    check(image.is_file() and image.stat().st_size > 0, "Missing curve artifact")
+    if checkpoint["mode"] == "formal":
+        check(checkpoint["source_mode"] == "formal" and checkpoint["source_epoch"] == checkpoint["epoch"] == 100,
+              "Formal evaluation did not use 100/100 epochs")
+    print(f"CSV verified: {len(table)} actual flights; dev={(table.split == 'dev').sum()}, test={(table.split == 'test').sum()}")
+    print(f"Evaluation mode={checkpoint['mode']}; CSV/reference/prediction/metrics/curves agree; no test refitting or clipping")
+    print("PASS: T5 exported evaluation artifacts (degenerate-input metric gate pending)")
+
+
 def plot_data(config, split, unit, cycle, parameters):
     """Plot one sampled flight and the unit's full reference HI trajectory."""
     import matplotlib
@@ -497,13 +587,14 @@ def plot_data(config, split, unit, cycle, parameters):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation", "hi"])
+    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation", "hi", "metrics", "evaluation"])
     parser.add_argument("--config", required=True)
     parser.add_argument("--split", choices=["dev", "test"])
     parser.add_argument("--unit", type=int)
     parser.add_argument("--cycle", type=int)
     parser.add_argument("--parameters", nargs="+", help="X_s/W variable names to plot")
     parser.add_argument("--checkpoint")
+    parser.add_argument("--run-dir")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.task == "data":
@@ -518,6 +609,12 @@ def main():
         if args.checkpoint is None:
             parser.error("hi requires --checkpoint")
         verify_hi(config, args.checkpoint)
+    elif args.task == "metrics":
+        verify_metrics(config)
+    elif args.task == "evaluation":
+        if args.run_dir is None:
+            parser.error("evaluation requires --run-dir")
+        verify_evaluation(config, args.run_dir)
     else:
         if any(value is None for value in (args.split, args.unit, args.cycle, args.parameters)):
             parser.error("data-plot requires --split, --unit, --cycle and --parameters")

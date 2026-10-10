@@ -12,8 +12,8 @@
 | T1 数据管线 | 已验收 | 全量数据验证、data-plot 通过；commit 0c4b4aa | 用户回复“确认通过，开始 T2” |
 | T2 模型与损失 | 已验收 | 真实前向/反向及机制验证通过；commit 40289d6 | 用户回复“开始 T3”，确认继续 |
 | T3 表示学习 | 实现及 smoke 已验收 | Stage 1 smoke、checkpoint 通过；commit 2d8e4cb；正式训练未运行 | 用户回复“开始T4”，确认继续 |
-| T4 排序学习 | 实现及 smoke 完成，待验收 | 全部 663 条训练表示、3 epochs；采样、冻结、独立推理、训练缩放通过 | 用户已授权执行；待验收 |
-| T5 评价 | 未开始 | 未计算评价指标 | 待 T4 验收 |
+| T4 排序学习 | 实现及 smoke 已验收 | 全部 663 条训练表示、3 epochs；采样、冻结、独立推理、训练缩放通过；commit c870ed6 | 用户回复“开始 T5”，确认继续 |
+| T5 评价 | 进行中，退化处理待确认 | 正式 100/100 epochs、非退化指标及真实导出验证通过；尚缺退化指标实现与验证 | 用户回复“开始 T5”，授权执行；待验收 |
 
 T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
 并将用户提供的两份规则与方案文件纳入首次本地提交。Python 实现文件按后续任务创建。
@@ -21,6 +21,7 @@ T1 新增 data.py 与 verify.py 的数据验证入口，更新数据配置和本
 T2 新增 model.py、losses.py，并扩展 verify.py 的模型机制检查。
 T3 新增 train.py 的 Stage 1 入口与 checkpoint 加载，扩展 verify.py 的表示训练检查。
 T4 扩展 train.py 的 HI 排序训练、完整 checkpoint 加载与缩放，并增加 verify.py 的 HI 检查。
+T5 新增 metrics.py、evaluate.py，扩展 data.py 的独立评价 RUL 读取和 verify.py 的评价检查。
 
 ## 环境与 T0 验证
 
@@ -86,8 +87,8 @@ Stage 2 冻结表示模块，`h=sigmoid(-g(mu_I))`。
 HI/RUL 仅作评价；归一化与全局 HI Min–Max 仅由训练数据或训练预测拟合。
 结构不保证表示解耦或物理尺度标定，不使用测试标签选模或早停。
 
-当前已创建数据管线、模型、损失、两阶段训练和验证入口，已完成两阶段 smoke。
-尚未实现评价指标，尚未运行正式训练。
+当前已创建数据管线、模型、损失、两阶段训练和评价入口，已完成两阶段 smoke。
+T5 已完成正式训练和真实评价导出，指标退化处理及最终验收仍待确认，见下文。
 本项目仅使用本地 Git，不配置远端，不 push。原始数据、缓存、权重、outputs 和凭据不提交。
 
 ## T1 运行与真实数据验证
@@ -369,3 +370,102 @@ with torch.no_grad():
 
 正式 Stage 2 入口已实现，预算 100 epochs；本次只执行 smoke，**两阶段正式训练均未运行**，
 CUDA 未验证，未计算评价指标或启动 T5。正式评价前仍须先完成正式 Stage 1→Stage 2。
+
+## T5 评价与端到端运行
+
+以上 T0–T4 的 CPU 与未执行正式训练记录是对应任务交付时的历史状态。
+T5 发现沙箱内 CUDA 不可见，宿主环境实际有两张 RTX 3090；正式运行按已批准 auto
+配置使用 cuda（单卡，无分布式）。未完成的 CPU 尝试保留在
+`outputs/representation_formal_20261010T092156715251Z/`，不作为正式模型。
+完整预算从头在 GPU 执行，没有改变网络、损失、batch、flight 长度或初始化规则。
+CUDA 模型机制验证已通过，包括真实前向/反向、padding、信息路径和解析损失检查。
+
+完整运行命令如下。两阶段每次创建新的时间戳目录，将占位路径替换为上一条命令的实际输出。
+
+```bash
+python data.py --config config.yaml --prepare
+python verify.py --task data --config config.yaml
+python verify.py --task model --config config.yaml
+python train.py --config config.yaml --stage representation
+python verify.py --task representation --config config.yaml --checkpoint outputs/<representation_run>/representation.pt
+python train.py --config config.yaml --stage hi --representation outputs/<representation_run>/representation.pt
+python verify.py --task hi --config config.yaml --checkpoint outputs/<hi_run>/ocald.pt
+python verify.py --task metrics --config config.yaml
+python evaluate.py --config config.yaml --checkpoint outputs/<hi_run>/ocald.pt
+python verify.py --task evaluation --config config.yaml --run-dir outputs/<hi_run>
+```
+
+正式预算为 Stage 1/Stage 2 各 100 epochs，只保存最后一轮，不用评价标签选模。
+本次 GPU Stage 1 目录为 `outputs/representation_formal_20261010T102117772658Z/`。
+仅完成 smoke 时，必须在报告与曲线中保留 smoke 标记，不能作为正式实验结果。
+
+评价输出写入对应完整 checkpoint 所在目录：
+
+| 文件 | 内容 |
+|---|---|
+| predictions.csv | dev/test 全部 1101 条 flight；split/unit/cycle/hi_raw/hi_scaled/hi_gt/rul |
+| metrics.json | raw/scaled 整体及适用的逐设备指标、有效计数、模式和来源轮数、训练缩放参数 |
+| hi_curves.png | 全部 15 台设备的完整 raw/scaled 曲线、参考 HI 和逐设备指标 |
+
+HI/RUL 按 unit/cycle 一对一关联，缺失、额外或重复键会报错，禁止位置拼接。
+原始 RUL 已核对 1101 条 flight 内数值恒定且非负；独立 `read_rul` 每次重新检查这一事实，
+不满足时报错。训练准备、Stage 1 和 Stage 2 调用路径不读取这些评价量。
+参考 HI 表无 cycle 字段的限制与 T1 相同，仍使用已核对的设备内行顺序约定。
+
+| 指标 | 参考口径 |
+|---|---|
+| MAE | 对所有 flight 的绝对误差求均值 |
+| MAPE (%) | 排除 HI_gt=0，再按 flight 汇总；报告有效数量 |
+| 单调性 | 设备内正/非正差分计数差的绝对值除以差分数；零差分归非正；整体为设备均值 |
+| 趋势性 | 设备内 HI/cycle Spearman；整体先求有符号均值再取绝对值 |
+| 失效一致性 | exp(-std(各设备末 HI, ddof=0)/mean(各设备首 HI−末 HI))；仅整体 |
+| MI | 设备内 sklearn 默认 3 邻居估计 HI/RUL 互信息，seed=42；取 1−exp(-MI)，整体为设备均值 |
+
+非退化手算例与固定参考 commit 的六项公式核对通过；表行打乱不改变结果。
+小样本、常数序列和零分母的具体退化处理正在等待用户确认，当前明确报错，尚未宣称完整指标验收通过。
+训练 HI 零极差按已批准方案使 scaled 不可用，不加 epsilon；测试不重新拟合、裁剪或平滑。
+失效一致性若因平均首末差为负而超过 1，保留参考公式结果并解释，不悄悄改公式。
+
+CSV 使用 17 位有效数字并以 round_trip 读取，指标及曲线都由导出的同一表生成，
+避免 float32 指标计算与 CSV 的 float64 重算产生差异。验证重新推理并检查实际行数、
+参考关联、CSV 数值、双尺度、指标一致性以及曲线点值；失败返回非零退出码。
+训练 Min–Max 只是评价后处理，曲线和指标不能证明潜变量解耦或物理尺度标定。
+
+已完成 smoke 导出验证：使用 `outputs/hi_smoke_20261010T090923928503Z/ocald.pt`，
+输出 663 条 dev 和 438 条 test；预测、标签、CSV、指标与曲线一致。
+正式运行输出：
+
+| 阶段 | 输出目录 | 实际结果 |
+|---|---|---|
+| Stage 1 | `outputs/representation_formal_20261010T102117772658Z/` | CUDA，全部 663 flight，100 epochs；最后负 ELBO 29.073746，重构 28.050419，KL_I 0.062563，KL_C 0.960764 |
+| Stage 2 | `outputs/hi_formal_20261010T104138118262Z/` | CUDA，100 epochs；最后总损失 0.687845，order 0.687127，未乘系数 L2 7.183465 |
+
+正式表示 checkpoint 验证通过，保存/加载四组后验最大绝对误差为 0。
+正式 HI checkpoint 验证通过：冻结权重与缓冲区逐值一致、头更新、均匀采样、独立推理和训练缩放均通过。
+正式预测导出及评价验证通过，663 dev/438 test，与重新推理、参考标签、CSV 指标和曲线点值一致。
+最后一轮训练 raw HI 极值为 0.410069942..0.568396688；test scaled 范围为
+−0.035984..0.999826，未裁剪。正式图已查看，15 台设备编号和指标均显示。
+
+| split / 尺度 | MAE | MAPE (%) / 有效数量 | 单调性 | 趋势性 | 失效一致性 | MI |
+|---|---|---|---|---|---|---|
+| dev raw | 0.340664 | 71.313839 / 654 | 0.045597 | 0.114314 | 4.171531e-08 | 0.036016 |
+| dev scaled | 0.384121 | 75.278862 / 654 | 0.045597 | 0.114314 | 4.171470e-08 | 0.036016 |
+| test raw | 0.323512 | 70.778683 / 432 | 0.051596 | 0.057376 | 0.094559 | 0.015828 |
+| test scaled | 0.355946 | 68.945694 / 432 | 0.051596 | 0.057376 | 0.094559 | 0.015828 |
+
+上述为完整批准预算的单次正式运行，不是 smoke；单调性和趋势性较弱，不能认为 HI 学习效果良好。
+没有根据测试指标修改模型、训练或后处理；未开展多种子、其他数据集、基线或消融实验。
+
+直接重验本次正式产物：
+
+```bash
+python verify.py --task representation --config config.yaml --checkpoint outputs/representation_formal_20261010T102117772658Z/representation.pt
+python verify.py --task hi --config config.yaml --checkpoint outputs/hi_formal_20261010T104138118262Z/ocald.pt
+python verify.py --task metrics --config config.yaml
+python evaluate.py --config config.yaml --checkpoint outputs/hi_formal_20261010T104138118262Z/ocald.pt
+python verify.py --task evaluation --config config.yaml --run-dir outputs/hi_formal_20261010T104138118262Z
+```
+
+预期均退出 0；metrics/evaluation 当前 PASS 明确标注退化输入的完整验收门槛仍待确认。
+本任务尚未完成：常数序列、小样本、全零参考值及零分母的处理确认后再实现并重验，
+然后提交最终 T5 验收。代码编译和 Git diff 空白检查通过；数据、权重、输出均未提交。
