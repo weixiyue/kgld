@@ -313,6 +313,122 @@ def verify_representation(config, path):
     print("PASS: T3 representation training and checkpoint verification")
 
 
+def verify_hi(config, path):
+    import csv
+    from losses import hi_loss
+    from train import (REPRESENTATION_MODULES, extract_training_means, load_ocald,
+                       representation_state, sample_pairs, scale_hi,
+                       valid_pair_pools, validate_hi_config)
+
+    validate_hi_config(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cpu":
+        torch.set_num_threads(1)
+    model, checkpoint = load_ocald(path, device)
+    check(checkpoint["config"] == config, "HI checkpoint configuration differs")
+    check(checkpoint["mode"] in ("smoke", "formal"), "Unknown HI checkpoint mode")
+    epochs = config["smoke"]["hi_epochs"] if checkpoint["mode"] == "smoke" else config["training"]["hi"]["epochs"]
+    check(checkpoint["epoch"] == epochs, "HI checkpoint is not the last approved epoch")
+    check(checkpoint["mode"] == "smoke" or checkpoint["source_mode"] == "formal", "Formal HI used smoke representation")
+    before = checkpoint["verification"]["representation_before"]
+    after = representation_state(model)
+    check(set(before) == set(after) and all(torch.equal(before[key], after[key]) for key in before),
+          "Frozen representation weights or buffers differ before/after HI training")
+    check(all(not getattr(model, name).training and all(not p.requires_grad for p in getattr(model, name).parameters())
+              for name in REPRESENTATION_MODULES), "Loaded representation is not frozen/eval")
+    initial_head = checkpoint["verification"]["initial_head"]
+    check(set(initial_head) == set(dict(model.hi_head.named_parameters()))
+          and any(not torch.equal(initial_head[key], value.detach().cpu()) for key, value in model.hi_head.named_parameters()),
+          "HI head did not update")
+    processed = load_processed(config)
+    dataset = FlightDataset(processed, "dev")
+    means, units, cycles = extract_training_means(model, dataset, config["training"]["representation"]["batch_size"], device)
+    check(torch.equal(units.cpu(), checkpoint["verification"]["units"])
+          and torch.equal(cycles.cpu(), checkpoint["verification"]["cycles"]), "Training identifier alignment mismatch")
+    for field in ("x", "w"):
+        for key in ("min", "max"):
+            check(torch.equal(checkpoint["normalization"][field][key], processed["normalization"][field][key]),
+                  "HI checkpoint normalization differs from full training normalization")
+    pools = valid_pair_pools(units, cycles, config["training"]["hi"]["min_cycle_gap"])
+    pairs = checkpoint["verification"]["last_pairs"].to(device)
+    check(pairs.shape == (len(dataset), 2) and pairs.dtype == torch.int64
+          and (pairs >= 0).all() and (pairs < len(dataset)).all(), "Invalid sampled pair indices")
+    early, late = pairs[:, 0], pairs[:, 1]
+    check((units[early] == units[late]).all() and (cycles[late] - cycles[early] >= 5).all(), "Invalid same-unit order or cycle gap")
+    with torch.no_grad():
+        hi_raw = torch.sigmoid(-model.hi_head(means)).cpu()
+        probe = collate_fn([dataset[index] for index in range(min(3, len(dataset)))])
+        predicted = model.predict_hi(probe["x"].to(device), probe["mask"].to(device)).cpu()
+        repeated = model.predict_hi(probe["x"].to(device), probe["mask"].to(device)).cpu()
+    check(torch.isfinite(hi_raw).all() and ((hi_raw > 0) & (hi_raw < 1)).all(), "Invalid raw training HI")
+    torch.testing.assert_close(hi_raw, checkpoint["verification"]["train_hi_raw"], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(predicted, checkpoint["verification"]["probe_hi_before_save"], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(predicted, repeated, rtol=0, atol=0)
+    parameters = checkpoint["hi_minmax"]
+    saved_raw = checkpoint["verification"]["train_hi_raw"]
+    check(parameters == {"min": saved_raw.min().item(), "max": saved_raw.max().item(), "fit_split": "dev", "count": len(dataset)},
+          "HI Min–Max parameters are not from all training predictions")
+    if parameters["min"] == parameters["max"]:
+        print("Training HI range zero: scaled HI unavailable")
+    else:
+        scaled = scale_hi(saved_raw, parameters)
+        torch.testing.assert_close(scaled.min(), torch.tensor(0.))
+        torch.testing.assert_close(scaled.max(), torch.tensor(1.))
+        # Out-of-range predictions stay out of range; no implicit clipping.
+        span = parameters["max"] - parameters["min"]
+        synthetic = torch.tensor([parameters["min"] - span, parameters["max"] + span], dtype=torch.float64)
+        torch.testing.assert_close(scale_hi(synthetic, parameters), torch.tensor([-1., 2.], dtype=torch.float64))
+    try:
+        scale_hi(torch.tensor([0.5]), {"min": 0.5, "max": 0.5})
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Zero HI range was silently rescaled")
+    objective = hi_loss(model.hi_head(means[early[:128]]), model.hi_head(means[late[:128]]), model.hi_head,
+                        config["training"]["hi"]["kappa"], config["training"]["hi"]["l2_coefficient"])
+    objective["loss"].backward()
+    check(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.hi_head.parameters())
+          and any(p.grad.abs().sum() > 0 for p in model.hi_head.parameters()), "HI head has missing/zero/nonfinite gradients")
+    check(all(p.grad is None for name in REPRESENTATION_MODULES for p in getattr(model, name).parameters()),
+          "HI objective reached frozen representation")
+
+    # A small deliberately unsorted case has unequal counts per early cycle.
+    toy_units = torch.tensor([2, 1, 1, 1, 1, 2], device=device)
+    toy_cycles = torch.tensor([1, 12, 1, 7, 6, 6], device=device)
+    toy = valid_pair_pools(toy_units, toy_cycles, 5)
+    for unit, candidates in toy:
+        expected = {(a, b) for a in range(6) for b in range(6)
+                    if toy_units[a] == toy_units[b] == unit and toy_cycles[b] - toy_cycles[a] >= 5}
+        check(set(map(tuple, candidates.cpu().tolist())) == expected, "Pair pool differs from independently enumerated pairs")
+    torch.manual_seed(42)
+    draws = sample_pairs(toy, 12000)
+    for _, candidates in toy:
+        counts = torch.tensor([int((draws == pair).all(1).sum()) for pair in candidates])
+        expected_count = 12000 / len(toy) / len(candidates)
+        check(((counts - expected_count).abs() < 0.15 * expected_count).all(), "Sampling is not uniform over units then valid pairs")
+    try:
+        valid_pair_pools(torch.tensor([1, 1], device=device), torch.tensor([1, 2], device=device), 5)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("No-pair input was accepted")
+    with Path(path).with_name("losses.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    check(len(rows) == epochs, "Incomplete HI epoch log")
+    for epoch, row in enumerate(rows, 1):
+        check(row["stage"] == "hi" and row["mode"] == checkpoint["mode"] and int(row["epoch"]) == epoch
+              and int(row["pairs"]) == len(dataset), "Invalid HI epoch metadata")
+        values = [float(row[key]) for key in ("loss", "order", "l2")]
+        check(np.isfinite(values).all() and np.isclose(values[0], values[1] + 0.0001 * values[2], rtol=1e-6), "Invalid HI loss components")
+    print(f"Stage 2 checkpoint: mode={checkpoint['mode']}, source={checkpoint['source_mode']}, epoch={epochs}, device={device}")
+    print(f"Training flights={len(dataset)}; valid pairs per unit={[(int(unit.item()), len(pool)) for unit, pool in pools]}")
+    print("Frozen weights/buffers exact; HI head updated and receives gradients; inference uses X/mask only")
+    print(f"Train raw HI: {parameters['min']:.9f}..{parameters['max']:.9f}; Min–Max fit=dev, count={parameters['count']}")
+    print("Uniform unit/pair sampling, invalid/no-pair handling, deterministic reload, train-only scaling and no clipping verified")
+    print("Last epoch loss:", {key: float(rows[-1][key]) for key in ("loss", "order", "l2")})
+    print("PASS: T4 HI training and independent inference verification")
+
+
 def plot_data(config, split, unit, cycle, parameters):
     """Plot one sampled flight and the unit's full reference HI trajectory."""
     import matplotlib
@@ -381,7 +497,7 @@ def plot_data(config, split, unit, cycle, parameters):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation"])
+    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation", "hi"])
     parser.add_argument("--config", required=True)
     parser.add_argument("--split", choices=["dev", "test"])
     parser.add_argument("--unit", type=int)
@@ -398,6 +514,10 @@ def main():
         if args.checkpoint is None:
             parser.error("representation requires --checkpoint")
         verify_representation(config, args.checkpoint)
+    elif args.task == "hi":
+        if args.checkpoint is None:
+            parser.error("hi requires --checkpoint")
+        verify_hi(config, args.checkpoint)
     else:
         if any(value is None for value in (args.split, args.unit, args.cycle, args.parameters)):
             parser.error("data-plot requires --split, --unit, --cycle and --parameters")

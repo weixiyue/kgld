@@ -11,8 +11,8 @@
 | T0 初始化 | 已验收 | 依赖、路径及忽略规则通过；commit b98f60d | 用户回复“开始T1”，确认继续 |
 | T1 数据管线 | 已验收 | 全量数据验证、data-plot 通过；commit 0c4b4aa | 用户回复“确认通过，开始 T2” |
 | T2 模型与损失 | 已验收 | 真实前向/反向及机制验证通过；commit 40289d6 | 用户回复“开始 T3”，确认继续 |
-| T3 表示学习 | 实现及 smoke 完成，待验收 | 32 条真实 flight、3 epochs；更新、日志、checkpoint 独立加载通过；正式训练未运行 | 用户已授权执行；待验收 |
-| T4 排序学习 | 未开始 | 未验证冻结、采样或推理 | 设计与预算已批准；待 T3 验收 |
+| T3 表示学习 | 实现及 smoke 已验收 | Stage 1 smoke、checkpoint 通过；commit 2d8e4cb；正式训练未运行 | 用户回复“开始T4”，确认继续 |
+| T4 排序学习 | 实现及 smoke 完成，待验收 | 全部 663 条训练表示、3 epochs；采样、冻结、独立推理、训练缩放通过 | 用户已授权执行；待验收 |
 | T5 评价 | 未开始 | 未计算评价指标 | 待 T4 验收 |
 
 T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
@@ -20,6 +20,7 @@ T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
 T1 新增 data.py 与 verify.py 的数据验证入口，更新数据配置和本文记录。
 T2 新增 model.py、losses.py，并扩展 verify.py 的模型机制检查。
 T3 新增 train.py 的 Stage 1 入口与 checkpoint 加载，扩展 verify.py 的表示训练检查。
+T4 扩展 train.py 的 HI 排序训练、完整 checkpoint 加载与缩放，并增加 verify.py 的 HI 检查。
 
 ## 环境与 T0 验证
 
@@ -85,8 +86,8 @@ Stage 2 冻结表示模块，`h=sigmoid(-g(mu_I))`。
 HI/RUL 仅作评价；归一化与全局 HI Min–Max 仅由训练数据或训练预测拟合。
 结构不保证表示解耦或物理尺度标定，不使用测试标签选模或早停。
 
-当前已创建数据管线、模型、损失、Stage 1 训练和验证入口，已完成 Stage 1 smoke。
-尚未实现 Stage 2 训练或评价指标，尚未运行正式训练。
+当前已创建数据管线、模型、损失、两阶段训练和验证入口，已完成两阶段 smoke。
+尚未实现评价指标，尚未运行正式训练。
 本项目仅使用本地 Git，不配置远端，不 push。原始数据、缓存、权重、outputs 和凭据不提交。
 
 ## T1 运行与真实数据验证
@@ -298,3 +299,73 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python train.py --config config.yaml --stage
 
 本次只完成 smoke，**正式 100 epochs 未运行**，CUDA 未验证，Stage 2 未实现或启动。
 正式评价前仍需完成正式 Stage 1→Stage 2；本次 smoke 结果仅作为训练与加载流程验证。
+
+## T4 HI 排序学习与独立推理
+
+使用 T3 的表示 checkpoint 独立启动，不要求在同一进程先训练 Stage 1：
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python train.py --config config.yaml --stage hi --representation outputs/representation_smoke_20261010T084030540551Z/representation.pt --smoke
+```
+
+实际交付输出目录：`outputs/hi_smoke_20261010T090923928503Z/`，包含 config.yaml、losses.csv、
+最后一轮完整 ocald.pt。重新运行创建新的时间戳目录，不覆盖表示 checkpoint 或正式输出。
+训练完整加载 Stage 1 表示模块并设 eval、requires_grad=False，提取全部 663 条 dev flight 的
+mu_I 到内存，只优化 HI 头。训练路径不读取参考 HI 或 RUL，不用 cycle 预测 HI。
+
+同设备周期排序及对构造在表示所在设备上执行。枚举所有周期差≥5的早晚对，然后均匀选
+具有有效对的设备，再均匀选该设备的完整有效对，允许重复。设备对应有效对数为：
+1:2278、2:2346、3:1953、4:1540、5:3916、6:1711、7:2850、8:2211、9:3160。
+每个 epoch 抽取 N_train=663 对，batch=128 对，最后一个批次包含剩余 23 对。
+没有有效对时明确报错；重复 unit/cycle 也会报错。
+
+实际使用 CPU、Stage 1 smoke 权重、Stage 2 的 3 epochs smoke 预算：
+
+| epoch | 总损失 | order | 未乘系数的 L2 |
+|---|---|---|---|
+| 1 | 0.693957 | 0.693275 | 6.823696 |
+| 2 | 0.693864 | 0.693209 | 6.554293 |
+| 3 | 0.693663 | 0.693032 | 6.309800 |
+
+Adam lr=0.001、weight_decay=0；使用显式含偏置 L2，系数 0.0001，温度 1。
+CSV 分项按实际样本对数加权汇总。表示参数及缓冲区训练前后逐值一致，保持 eval 且无梯度；
+HI 头获得有限梯度并更新。训练前表示快照和头初始参数随 checkpoint 保存，供验证。
+
+全部训练预测 `hi_raw` 范围为 `0.512035787..0.514756441`，变化很小。
+全局 Min–Max 仅拟合这 663 条训练预测；未读取评价标签，未逐设备拟合，未平滑或裁剪。
+该缩放是评价后处理，不能视为物理标定。极差为零时明确报告 scaled 不可用，
+`scale_hi` 会报错，不添加 epsilon。当前范围虽非零，不能据此认定健康表征有效。
+
+独立验证：
+
+```bash
+python verify.py --task hi --config config.yaml --checkpoint outputs/hi_smoke_20261010T090923928503Z/ocald.pt
+```
+
+预期退出 0，末行显示 `PASS: T4 HI training and independent inference verification`。
+检查包含：真实对的设备/间隔/索引、冻结快照与最终状态完全一致、头参数更新与梯度、
+仅 X/mask 推理、原始 HI 在 (0,1)、重复预测一致、保存/加载一致、完整训练归一化和
+仅训练预测拟合的 Min–Max；缩放超范围值仍保留，无有效对及零极差被明确拒绝。
+另用一个打乱周期且早期 flight 候选数不同的小例子，独立枚举对并做固定种子抽样检查，
+检验均匀设备及均匀有效对分布，防止误用“均匀早期 cycle 再选晚期 cycle”的分布。
+
+独立加载无需原始 HDF5、参考表、表示源 checkpoint 或预处理文件：
+
+```python
+import torch
+from train import load_ocald, scale_hi
+model, checkpoint = load_ocald(checkpoint_path, torch.device('cpu'))
+# x 使用 checkpoint['normalization']['x'] 进行训练参数归一化。
+with torch.no_grad():
+    hi_raw = model.predict_hi(x, mask)
+    hi_scaled = scale_hi(hi_raw, checkpoint['hi_minmax'])
+```
+
+已在禁止 HDF5 访问的独立加载检查中，用单点合成输入仅传 X/mask 推理通过；
+该合成输入检查用于证明接口独立，真实验证另使用全部训练 flight。
+完整 checkpoint 保存模型、训练归一化、列名、阶段、来源模式/epoch 和训练 HI Min–Max。
+正式 Stage 2 要求正式表示 checkpoint；将 smoke 表示传给正式入口实测退出码 1，未启动训练。
+原有 T3 checkpoint 验证、编译及 Git diff 检查也通过。
+
+正式 Stage 2 入口已实现，预算 100 epochs；本次只执行 smoke，**两阶段正式训练均未运行**，
+CUDA 未验证，未计算评价指标或启动 T5。正式评价前仍须先完成正式 Stage 1→Stage 2。
