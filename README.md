@@ -249,7 +249,7 @@ python diagnose.py --config config.yaml --representation "$REP_RUN/representatio
 按设备等权平均。整体 HI 范围、总体标准差及 MAE 按全部 flight 计算；不做 HI Min–Max。
 验证检查表示参数/缓冲区未变、头初始参数相同、配对批次一致、仅 dev 拟合及两组
 重新加载后 dev/test 分数逐值一致；成功末行显示 `PASS: D1 ...`，失败返回非零退出码。
-这里只支持 D1；其他表示比较、少量配对拟合或联合训练尚未实现。
+当前支持 D1 和下节的 D2；少量配对拟合或联合训练尚未实现。
 
 本次 D1 使用 `outputs/representation_formal_20261010T102117772658Z/representation.pt`。
 CUDA smoke（各 3 epochs）输出为 `outputs/diagnostics_20261012T055435561291Z/`，
@@ -269,4 +269,63 @@ dev/test 分别穷举 21965/14429 对，两组平局均为 0。dev 逐维总体�
 标准化使 dev/test 正确率分别提高约 4.52/4.74 个百分点；9 台 dev 均改善，6 台 test 中 5 台改善。
 这支持当前头对表示的利用受中心化/尺度处理影响，但排序能力仍弱；标准化也改变了相同 L2
 在原始坐标中的有效约束，单次实验不能区分尺度、优化与正则作用，也不能认定退化信息已丢失。
-这是重新训练的配对对照，不以旧 ocald.pt 代替 raw 对照。D1 已完成，等待用户验收。
+这是重新训练的配对对照，不以旧 ocald.pt 代替 raw 对照。D1 已完成，用户随后授权 D2。
+
+## 11. D2：两块表示的顺序信息诊断
+
+`blocks` 实验使用同一正式表示 checkpoint，冻结表示模块，同次提取确定性 mu_I/mu_C。
+本次重新训练三组：`zi_standardized` 和 `zc_standardized` 为 8→16→1（各 161 个参数），
+`zic_standardized` 为 16→16→1（289 个参数）。前两组初始参数逐值相同；拼接头按种子 42
+可重复初始化，容量更大，不声称与前两组相同。三个优化器独立，三组的配对及批次顺序一致。
+沿用 D1 的 seed=42、Adam lr=0.001/weight_decay=0、kappa=1、显式含偏置 L2=0.0001、
+batch=128 对、周期差≥5、每轮 N_train 对及最后一轮权重。
+
+```bash
+REP_RUN="outputs/representation_formal_实际时间戳"
+python diagnose.py --config config.yaml --representation "$REP_RUN/representation.pt" --experiment blocks --smoke
+python diagnose.py --config config.yaml --representation "$REP_RUN/representation.pt" --experiment blocks
+```
+
+先运行三组各 3 epochs 的 smoke，再重新初始化运行各 100 epochs。每次创建独立的
+`outputs/diagnostics_<UTC时间戳>/`，不读取 D1 的头或覆盖其结果。
+I/C 均以全部 dev 逐维拟合均值/总体标准差（ddof=0），零标准差分母为 1 并记录；test 复用。
+拼接组使用同一组逐维参数拼接，独立核对 16 维拟合结果，仅容许 float64 求和误差；
+实际特征满足“先分别标准化再拼接”与“拼接后应用逐维参数”逐值一致，无长度归一化或降维。
+
+输出沿用 D1 的 comparison、统计、训练日志、头文件、预测表及两张对照图：
+
+- `latent_stats.csv` 增加 `block`（I/C），含 dev/test 总体及 dev 每设备内部的逐维统计。
+- `comparison.csv` 保留原列并增加 `head_parameters`。accuracy/tie_rate/order/有符号 Spearman
+  的 `unit=all` 行均为设备等权均值；flights/pairs/correct_count/tie_count 为数量求和，
+  hi_min/hi_max/hi_std 与 MAE 按全部 flight 汇总，不能用总正确数/总对数代替等权正确率。
+- 三组 `predictions.csv` 列为 `experiment,split,unit,cycle,r,hi_raw,hi_gt`，排序使用 r，不用 Sigmoid 判断平局。
+- `head.pt` 包含初始/最终参数、输入维数、参数量、标准化参数、来源 checkpoint/哈希、种子和配置。
+- `pair_schedule.pt` 保留每轮对与 flight 键；`verification.json` 记录两个 8 维头初始化一致性、
+  逐轮各组配对批次哈希与一致性结果，以及冻结、键对齐、dev 拟合、拼接和重新加载检查。
+
+成功末行显示 `PASS: D2 blocks ...`；验证失败返回非零退出码。HI ground truth 在三组训练
+结束后才用于 MAE/绘图，不参与训练或选模；不读取 RUL。结论主要依据排序与有符号趋势。
+C 组更好不能证明纯退化表示，拼接组更好还需考虑增加的输入维数和参数量。
+三组若都差，不能直接据此判定数据没有退化信息。这些变体不替换正式 mu_I 信息路径。
+
+本次同一 Stage 1 checkpoint 下 CUDA smoke 输出为 `outputs/diagnostics_20261012T064958775403Z/`，
+正式输出为 `outputs/diagnostics_20261012T065145573317Z/`，三组分别完成 3/100 epochs，验证通过。
+独立复核保存的初始化、100 轮配对哈希、变换参数、176 行 I/C 统计、三组各 1101 条预测和
+51 行排序汇总；逐设备枚举结果、平均 softplus、有符号 Spearman 与 CSV 重算一致。
+正式初始化与 smoke 初始权重相同而非其训练后权重；源 checkpoint 哈希未变，两张图已查看。
+
+| 数据 | 输入 | 头参数量 | 设备等权正确率 | 设备等权 order | 平均有符号 HI/cycle Spearman |
+|---|---|---|---|---|---|
+| dev | I | 161 | 58.26% | 0.674458 | −0.213557 |
+| dev | C | 161 | 55.67% | 0.685102 | −0.145531 |
+| dev | I+C | 289 | 59.47% | 0.670487 | −0.246483 |
+| test | I | 161 | 55.99% | 0.688696 | −0.148830 |
+| test | C | 161 | 53.24% | 0.694340 | −0.086400 |
+| test | I+C | 289 | 55.97% | 0.688453 | −0.153804 |
+
+各组 dev/test 分别穷举 21965/14429 对，平局均为 0。C 相比 I 的正确率在 9 台 dev 中仅
+unit 5 改善，6 台 test 均下降；拼接相比 I 在 6/9 台 dev、2/6 台 test 改善。
+拼接总体 dev 提高 1.20 个百分点，test 下降约 0.02 个百分点，未见明确的测试排序提升。
+本次不支持顺序信息主要保留在 C 的判断，也未显示增加输入/参数量后有明显测试收益；
+三组整体排序仍弱，不能因此证明数据没有退化信息，或认定信息分块是唯一原因。
+这是单种子、固定表示和指定头的诊断，不以 MAE 选最佳组；D2 已完成，等待用户验收。
