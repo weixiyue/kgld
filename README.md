@@ -222,3 +222,51 @@ with torch.no_grad():
 - [UnsupervisedHI 参考仓库](https://github.com/KBaja/UnsupervisedHI)：采样、参考 HI 与指标口径；对应论文为 Bajarunas 等，*Health index estimation through integration of general knowledge with unsupervised learning*（2024）。
 - 核对版本 `157ebfae7baeee1e0cd52180f8e58ead3dcb448e`：[预处理 Notebook](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/01_data_preprocess.ipynb)、[采样函数](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/pre_process_utils.py)、[评价函数](https://github.com/KBaja/UnsupervisedHI/blob/157ebfae7baeee1e0cd52180f8e58ead3dcb448e/CMAPSS/eval_utils.py)。本项目独立实现 PyTorch OCALD，不声称复现参考仓库全部模型或实验。
 - 开发约定见 [AGENTS.md](AGENTS.md)，设计对照见 [OCALD_Implementation_Plan.md](OCALD_Implementation_Plan.md)；使用说明以当前代码为准。
+
+## 10. D1：内部表示尺度诊断
+
+`diagnose.py` 的 `scale` 实验冻结同一正式 Stage 1 表示，提取全部 dev/test 的 mu_I，
+分别重新训练 `zi_raw` 和 `zi_standardized` 两个独立 HI 头。标准化逐维使用全部 dev
+的均值及总体标准差（ddof=0），零标准差的分母为 1 并记录维度，test 复用 dev 参数。
+两头结构、初始权重、每轮配对及批次顺序相同，优化器独立，采样随机状态与初始化隔离。
+训练沿用 Stage 2 配置，smoke 为两组各 3 epochs，正式为两组各 100 epochs，均保存最后一轮。
+该变体仅用于诊断，不替换正式 OCALD；HI 标签只在两头完成训练后读取。
+
+```bash
+REP_RUN="outputs/representation_formal_实际时间戳"
+python diagnose.py --config config.yaml --representation "$REP_RUN/representation.pt" --experiment scale --smoke
+python diagnose.py --config config.yaml --representation "$REP_RUN/representation.pt" --experiment scale
+```
+
+每次创建新的 `outputs/diagnostics_<UTC时间戳>/`，正式实验重新初始化，不继承 smoke。
+先保存 `latent_stats.csv`（dev/test 总体逐维统计及 dev 每台设备内部统计），然后训练。
+输出 `comparison.csv`、`pair_schedule.pt`、`verification.json`、配置快照，以及两组各自的
+`losses.csv`、`predictions.csv` 和 `head.pt`；头文件包含初始/最终参数及必要标准化参数。
+两张图为 `training_comparison.png`（order 与加权 L2）和 `hi_comparison.png`（全部设备 raw HI）。
+
+评价枚举每台设备全部周期差≥5的有效对，以退化分数 r 的 `r_late>r_early` 判断正确，
+平局单独统计；`comparison.csv` 的 `unit=all` 行对 accuracy/tie_rate/order/有符号 Spearman
+按设备等权平均。整体 HI 范围、总体标准差及 MAE 按全部 flight 计算；不做 HI Min–Max。
+验证检查表示参数/缓冲区未变、头初始参数相同、配对批次一致、仅 dev 拟合及两组
+重新加载后 dev/test 分数逐值一致；成功末行显示 `PASS: D1 ...`，失败返回非零退出码。
+这里只支持 D1；其他表示比较、少量配对拟合或联合训练尚未实现。
+
+本次 D1 使用 `outputs/representation_formal_20261010T102117772658Z/representation.pt`。
+CUDA smoke（各 3 epochs）输出为 `outputs/diagnostics_20261012T055435561291Z/`，
+正式（各 100 epochs）输出为 `outputs/diagnostics_20261012T060208463300Z/`，均通过上述验证。
+另独立核对 CSV 中全部有效对计数、正确/平局计数、设备等权汇总及 loss 分项；
+手算例区分设备等权与配对加权，两张图已查看。正式源 checkpoint 哈希未变。
+
+| 数据 | 实验 | 设备等权排序正确率 | 穷举有效对的设备等权 order | 平均有符号 HI/cycle Spearman |
+|---|---|---|---|---|
+| dev | zi_raw | 53.75% | 0.688848 | −0.097772 |
+| dev | zi_standardized | 58.26% | 0.674458 | −0.213557 |
+| test | zi_raw | 51.25% | 0.694473 | −0.032071 |
+| test | zi_standardized | 55.99% | 0.688696 | −0.148830 |
+
+dev/test 分别穷举 21965/14429 对，两组平局均为 0。dev 逐维总体标准差为
+0.015151..0.081751，各设备内部逐维标准差为 0.011808..0.093462，无零标准差维度。
+标准化使 dev/test 正确率分别提高约 4.52/4.74 个百分点；9 台 dev 均改善，6 台 test 中 5 台改善。
+这支持当前头对表示的利用受中心化/尺度处理影响，但排序能力仍弱；标准化也改变了相同 L2
+在原始坐标中的有效约束，单次实验不能区分尺度、优化与正则作用，也不能认定退化信息已丢失。
+这是重新训练的配对对照，不以旧 ocald.pt 代替 raw 对照。D1 已完成，等待用户验收。
