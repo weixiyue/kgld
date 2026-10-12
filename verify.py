@@ -454,6 +454,23 @@ def verify_metrics(config):
         np.testing.assert_allclose(report["overall"][key]["value"], value, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(failure_consistency([p[:5], p[5:]]), expected["failure_consistency"])
     np.testing.assert_allclose(transformed_mi(p[:5], rul[:5], 42), transformed_mi(p[:5], rul[:5], 42), rtol=0, atol=0)
+    # Reference behavior: constant HI has monotonicity=1 and undefined
+    # Spearman is mapped to zero; constant inputs still reach sklearn MI.
+    import warnings
+    from scipy.stats import ConstantInputWarning
+    constant = np.full(10, .5)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ConstantInputWarning)
+        np.testing.assert_allclose(monotonicity(constant), 1.)
+        np.testing.assert_allclose(spearman(constant, np.arange(10)), 0.)
+        combined = evaluate_metrics(np.r_[constant, np.linspace(.9, .1, 10)],
+                                    np.tile(np.linspace(1., 0., 10), 2), np.repeat([1, 2], 10),
+                                    np.tile(np.arange(1, 11), 2), np.tile(np.arange(9, -1, -1), 2), 42)
+    np.testing.assert_allclose(combined["per_unit"]["1"]["mi"]["value"], 0.)
+    np.testing.assert_allclose(combined["overall"]["trend"]["value"], .5)
+    np.testing.assert_allclose(transformed_mi(np.arange(10.), np.ones(10), 42), 0.)
+    single = evaluate_metrics(p[:5], gt[:5], units[:5], cycles[:5], rul[:5], 42)
+    np.testing.assert_allclose(single["overall"]["failure_consistency"]["value"], 1.)
     shuffled = np.random.default_rng(42).permutation(len(p))
     check(evaluate_metrics(p[shuffled], gt[shuffled], units[shuffled], cycles[shuffled], rul[shuffled], 42) == report,
           "Metric results depend on table row order rather than keyed cycle order")
@@ -479,7 +496,7 @@ def verify_metrics(config):
     check(all(not zero_scale_report["splits"][split]["scaled"]["available"]
               and zero_scale_report["splits"][split]["raw"]["available"] for split in ("dev", "test")),
           "Zero training HI range did not mark scaled evaluation unavailable")
-    print("PASS: non-degenerate T5 metrics and keyed associations; edge-case policy awaits confirmation")
+    print("PASS: T5 reference-aligned metrics, keyed associations and train-only scale availability")
 
 
 def verify_evaluation(config, run_dir):
@@ -516,7 +533,7 @@ def verify_evaluation(config, run_dir):
               "Formal evaluation did not use 100/100 epochs")
     print(f"CSV verified: {len(table)} actual flights; dev={(table.split == 'dev').sum()}, test={(table.split == 'test').sum()}")
     print(f"Evaluation mode={checkpoint['mode']}; CSV/reference/prediction/metrics/curves agree; no test refitting or clipping")
-    print("PASS: T5 exported evaluation artifacts (degenerate-input metric gate pending)")
+    print("PASS: T5 evaluation verification (predictions, references, metrics and curves)")
 
 
 def plot_data(config, split, unit, cycle, parameters):

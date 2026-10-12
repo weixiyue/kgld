@@ -13,7 +13,7 @@
 | T2 模型与损失 | 已验收 | 真实前向/反向及机制验证通过；commit 40289d6 | 用户回复“开始 T3”，确认继续 |
 | T3 表示学习 | 实现及 smoke 已验收 | Stage 1 smoke、checkpoint 通过；commit 2d8e4cb；正式训练未运行 | 用户回复“开始T4”，确认继续 |
 | T4 排序学习 | 实现及 smoke 已验收 | 全部 663 条训练表示、3 epochs；采样、冻结、独立推理、训练缩放通过；commit c870ed6 | 用户回复“开始 T5”，确认继续 |
-| T5 评价 | 进行中，退化处理待确认 | 正式 100/100 epochs、非退化指标及真实导出验证通过；尚缺退化指标实现与验证 | 用户回复“开始 T5”，授权执行；待验收 |
+| T5 评价 | 实现与验证完成，待验收 | 正式 100/100 epochs、参考指标及 1101 条真实导出验证通过 | 用户授权 T5，并明确“先和参考实现对齐，参考实现代码中未考虑的问题暂时不用管”；待最终验收 |
 
 T0 只创建本 README、requirements.txt、.gitignore 和基础 config.yaml，
 并将用户提供的两份规则与方案文件纳入首次本地提交。Python 实现文件按后续任务创建。
@@ -88,7 +88,7 @@ HI/RUL 仅作评价；归一化与全局 HI Min–Max 仅由训练数据或训�
 结构不保证表示解耦或物理尺度标定，不使用测试标签选模或早停。
 
 当前已创建数据管线、模型、损失、两阶段训练和评价入口，已完成两阶段 smoke。
-T5 已完成正式训练和真实评价导出，指标退化处理及最终验收仍待确认，见下文。
+T5 已完成正式训练、参考指标对齐和真实评价导出，等待最终验收，见下文。
 本项目仅使用本地 Git，不配置远端，不 push。原始数据、缓存、权重、outputs 和凭据不提交。
 
 ## T1 运行与真实数据验证
@@ -422,7 +422,13 @@ HI/RUL 按 unit/cycle 一对一关联，缺失、额外或重复键会报错，�
 | MI | 设备内 sklearn 默认 3 邻居估计 HI/RUL 互信息，seed=42；取 1−exp(-MI)，整体为设备均值 |
 
 非退化手算例与固定参考 commit 的六项公式核对通过；表行打乱不改变结果。
-小样本、常数序列和零分母的具体退化处理正在等待用户确认，当前明确报错，尚未宣称完整指标验收通过。
+2026-10-12 用户明确要求先对齐参考实现，参考代码未考虑的问题暂时不用管。
+因此撤去额外的小样本、常数 HI/RUL 和单设备/零分母拦截，未增加 null 汇总约定。
+常数 HI 单调性为 1；Spearman 的 NaN 按参考实现转为 0；MI 直接调用 sklearn，
+仍保留已批准的 seed=42；单设备失效一致性直接按参考公式计算。
+验证覆盖常数 HI、常数 RUL 的 MI、Spearman NaN 转 0、单设备公式和原有手算/关联检查。
+参考未定义保护的空 MAPE、短序列、零分母等不增加特殊策略：底层函数可能报错或返回
+非有限数，JSON 导出仍要求有限数字。当前正式数据未触发这些情况，不声称它们已获额外处理。
 训练 HI 零极差按已批准方案使 scaled 不可用，不加 epsilon；测试不重新拟合、裁剪或平滑。
 失效一致性若因平均首末差为负而超过 1，保留参考公式结果并解释，不悄悄改公式。
 
@@ -466,6 +472,9 @@ python evaluate.py --config config.yaml --checkpoint outputs/hi_formal_20261010T
 python verify.py --task evaluation --config config.yaml --run-dir outputs/hi_formal_20261010T104138118262Z
 ```
 
-预期均退出 0；metrics/evaluation 当前 PASS 明确标注退化输入的完整验收门槛仍待确认。
-本任务尚未完成：常数序列、小样本、全零参考值及零分母的处理确认后再实现并重验，
-然后提交最终 T5 验收。代码编译和 Git diff 空白检查通过；数据、权重、输出均未提交。
+预期均退出 0；指标末行显示 `PASS: T5 reference-aligned metrics, keyed associations and train-only scale availability`，
+评价末行显示 `PASS: T5 evaluation verification (predictions, references, metrics and curves)`。
+2026-10-12 参考对齐修改后指标检查、正式重新导出及评价检查均退出 0；
+predictions.csv 和 metrics.json 的 SHA-256 与修改前一致，正式指标没有改变；无需重新训练。
+代码编译和 Git diff 空白检查通过；数据、权重、输出均未提交。
+T5 实现与验证完成，等待用户对最终本地 commit 明确验收，不自动扩展实验。
