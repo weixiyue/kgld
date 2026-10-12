@@ -2,7 +2,7 @@
 
 基于 PyTorch 的 N-CMAPSS DS03 flight 级健康指标（HI）学习。输入完整 flight 的传感器序列，先学习潜变量表示，再利用同设备 flight 的时间顺序训练 HI 头。
 
-当前支持原始 dev/test 划分、两阶段训练、smoke 验证、checkpoint 独立加载、raw/scaled HI 评价与曲线导出。未实现其他数据集、下游 RUL 预测、联合微调或基线/消融实验。HI ground truth 和 RUL 仅用于评价，不参与训练、选模或早停。结构不保证工况解耦，也不提供物理尺度标定。
+当前支持原始 dev/test 划分、两阶段训练、smoke 验证、checkpoint 独立加载、raw/scaled HI 评价与曲线导出，以及下文的独立诊断实验。未实现其他数据集、下游 RUL 预测或联合微调。HI ground truth 和 RUL 仅用于正式评价，不参与训练、选模或早停；新增 A/B 诊断全程不读取这两类标签。结构不保证工况解耦，也不提供物理尺度标定。
 
 ## 1. 网络与训练
 
@@ -329,3 +329,107 @@ unit 5 改善，6 台 test 均下降；拼接相比 I 在 6/9 台 dev、2/6 台 
 本次不支持顺序信息主要保留在 C 的判断，也未显示增加输入/参数量后有明显测试收益；
 三组整体排序仍弱，不能因此证明数据没有退化信息，或认定信息分块是唯一原因。
 这是单种子、固定表示和指定头的诊断，不以 MAE 选最佳组；D2 已完成，等待用户验收。
+
+## 12. A/B：重构潜变量贡献与 flight 手工特征
+
+两个脚本只读取已完成的正式表示 checkpoint 和既有 processed 数据；不重新预处理、
+修改正式模型或重训正式流程。需要显式 `--config` 和 `--representation`，检查配置、列名
+及归一化一致性；源 checkpoint 路径不硬编码、不自动选择最新文件。
+F0 的 58.26%/55.99% 复现检查对应下列 20261010 表示权重和 CUDA 环境。
+
+```bash
+REP="outputs/representation_formal_20261010T102117772658Z/representation.pt"
+python diagnostics_latent.py --config config.yaml --representation "$REP" --smoke
+python diagnostics_features.py --config config.yaml --representation "$REP" --smoke
+python diagnostics_latent.py --config config.yaml --representation "$REP"
+python diagnostics_features.py --config config.yaml --representation "$REP"
+```
+
+A 每次创建 `outputs/diagnostics/latent_<UTC时间戳>/`，输出 `reconstruction.csv`、
+`summary.txt` 和 `verification.json`。七种设置为后验均值、后验采样、I/C 同时清零、
+仅 I 清零、仅 C 清零、I 清零且 C 为 W 条件先验均值、split 内共同置换 I/C 后验均值。
+采样和置换分别使用 seed=42；置换允许原位，记录置换索引及原位数量，解码保留目标
+flight 自己的 mask 和时间位置。每条 flight 使用完整序列，无截断。
+重构为有效步/传感器平方误差和除以 `2*sigma_x_squared`，随后按 flight 等权平均；
+元素 MSE 为全部有效元素的 SSE/元素数，不对各 flight 的 MSE 等权平均。
+smoke 每 split 固定抽取最多 32 条完整 flight；完整运行覆盖 dev/test 全部 flight。
+对照重构接近只能支持该数据上潜变量贡献较弱，不单独证明后验塌缩。
+
+B 每次创建 `outputs/diagnostics/features_<UTC时间戳>/`。F0 为确定性 mu_I（8 维）；
+F1 为 14 个传感器的均值/总体标准差（28 维）；F2 追加线性插值的 10/50/90% 分位数
+（70 维）；F3 用带截距、无正则 OLS，以 W 四通道的均值/总体标准差解释 F1，取残差
+（28 维）。OLS 仅拟合 dev，test 复用，报告设计矩阵秩。
+随后四组分别用 dev 拟合逐维均值/总体标准差，test 复用、不裁剪；零标准差分母为 1
+并显式记录。flight 内及 dev 标准化均使用 ddof=0。cycle 不进入任何特征或模型输入。
+
+沿用 HIHead 的输入维度→16→1，各种子 42..46 的配对序列独立且四组共享；初始化与
+采样随机状态隔离，F0 seed=42 保持 D1 初始化/标准化/采样口径。Adam lr=0.001、
+weight_decay=0、100 epochs、每轮 N_dev 对、batch 128 对、gap≥5、kappa=1、
+含偏置显式 L2=1e-4，保存最后一轮，不按 dev/test 指标选模。不同输入维度改变参数量。
+B smoke 每台设备取最多 8 条覆盖其周期范围的完整 flight，所有四组、五种子各 3 epochs，
+标准化/OLS 仅在该 smoke dev 子集拟合；smoke 不承担 F0 正式数值复现。
+
+`ranking.csv` 保存各组/种子/split 的逐设备和 `unit=all` 汇总，穷举周期差≥5的所有对，
+以 r_late>r_early 判正确，平局计 0；accuracy、order、有符号 HI/cycle Spearman
+按设备等权平均。`seed_summary.csv` 为五种子均值及总体标准差（ddof=0）。
+`feature_spearman.csv` 保存每 split 的 28 个 F1 特征平均有符号 Spearman，以及正、负、
+零相关设备数和与 split 平均值同号的设备数（均值为零时为 0）。常数序列沿用现有
+metrics.spearman 的 NaN→0 行为。dev 是训练集，结果须按训练集内诊断解释。
+
+其余输出为 `losses.csv`、无标签的 `predictions.csv`、`diagnostic_state.pt`（初始/最终头、
+标准化参数、OLS 系数、五套配对序列和 flight 键）、`summary.txt`、`verification.json`。
+检查冻结/源文件未变、仅 dev 拟合、键对齐、配对独立重算及保存后重新加载预测一致；
+失败退出非零，成功打印 `PASS`。outputs 不进入 Git，不生成额外分析或图表。
+
+| 任务 | 状态 | 验证摘要 | 用户确认记录 |
+|---|---|---|---|
+| A/B 诊断 | 实现、smoke、完整实验及复核完成 | 现有七项 verify 全通过；F0 seed=42 既有指标及预测逐值一致 | 用户已确认实现计划；完成验收待确认 |
+
+本次 A/B 使用上述 20261010 表示 checkpoint，CUDA 执行，源权重哈希及冻结表示未变。
+smoke 输出为 `outputs/diagnostics/latent_20261012T072024831486Z/` 和
+`outputs/diagnostics/features_20261012T071626826824Z/`。
+完整输出为 `outputs/diagnostics/latent_20261012T072513166165Z/` 和
+`outputs/diagnostics/features_20261012T072514517700Z/`，均覆盖 dev/test 663/438 条 flight。
+
+| A 设置 | dev 重构均值 | dev 元素 MSE | test 重构均值 | test 元素 MSE |
+|---|---|---|---|---|
+| 后验均值 | 26.659882 | 0.004532 | 30.121786 | 0.004433 |
+| 后验采样 | 27.794172 | 0.004725 | 31.248185 | 0.004599 |
+| I/C 同时清零 | 325.109387 | 0.055270 | 359.299357 | 0.052879 |
+| 仅 I 清零 | 26.671318 | 0.004534 | 30.129674 | 0.004434 |
+| 仅 C 清零 | 325.766231 | 0.055381 | 360.382657 | 0.053038 |
+| I 清零，C 用条件先验均值 | 27.637741 | 0.004699 | 31.145155 | 0.004584 |
+| split 内打乱 I/C 后验均值 | 111.997040 | 0.019040 | 146.788455 | 0.021603 |
+
+清零 I 使 dev/test 重构仅增加约 0.043%/0.026%；同时清零两块误差约为原来的
+12.20/11.93 倍。当前结果支持解码器主要使用 C、较少使用 I，不支持“完全忽略潜变量”
+的猜测；零值消融并不独立证明后验塌缩，也不证明 C 是纯工况或纯退化信息。
+
+下表为五种子均值±总体标准差；正确率的标准差单位为百分点。
+
+| B 特征 | split | 排序正确率 (%) | order | 有符号 HI/cycle Spearman |
+|---|---|---|---|---|
+| F0 mu_I | dev | 58.77 ± 0.69 | 0.673252 ± 0.002275 | −0.230722 ± 0.017830 |
+| F0 mu_I | test | 55.83 ± 0.38 | 0.686651 ± 0.001810 | −0.147324 ± 0.011063 |
+| F1 均值/标准差 | dev | 93.49 ± 0.28 | 0.212413 ± 0.005130 | −0.935141 ± 0.003874 |
+| F1 均值/标准差 | test | 94.09 ± 0.35 | 0.203523 ± 0.004444 | −0.943219 ± 0.004183 |
+| F2 加分位数 | dev | 95.18 ± 0.28 | 0.156093 ± 0.002896 | −0.954870 ± 0.002841 |
+| F2 加分位数 | test | 94.26 ± 0.34 | 0.162651 ± 0.003696 | −0.943609 ± 0.004528 |
+| F3 线性残差 | dev | 96.04 ± 0.15 | 0.119913 ± 0.006168 | −0.964229 ± 0.001434 |
+| F3 线性残差 | test | 94.78 ± 0.22 | 0.134471 ± 0.006820 | −0.950290 ± 0.002678 |
+
+F0 seed=42 的 dev/test 正确率为 58.2630849569%/55.9904776289%，与 D1 既有
+未四舍五入 accuracy/order/Spearman 及全部 r/HI 预测逐值一致。
+flight 统计中存在指定头能利用的顺序信号；当前 mu_I 管线的弱排序不能归因于
+flight 数据完全没有信号。F3 只移除八维 W 统计量解释的线性部分，不保证全面工况解耦。
+以上不能单独定位表示瓶颈的原因，且仅适用于指定 checkpoint、数据及五个种子。
+
+完整 B 保存 2000 行训练日志、22020 行预测、340 行排序汇总和 56 行逐特征相关性。
+独立复核 CSV 的全部对计数、平局、设备等权、order、Spearman、跨种子均值/标准差、
+A 重构/MSE 关系及 L2 分项；NumPy 小样本核对统计/分位数，并用含平局、不同设备对数
+的手算例检查设备等权。检查通过，不以测试指标调整任何配置。
+现有 `verify.py` 的 data/model/metrics/representation/hi/evaluation/data-plot 七项通过，
+日志及独立复核记录位于 `outputs/diagnostics/verification_20261012T072254981157Z/`；
+representation 使用上述 checkpoint，hi/evaluation 使用
+`outputs/hi_formal_20261010T104138118262Z/`。data-plot 以该验证目录中的临时配置改变
+仅输出路径，没有改 `config.yaml` 或覆盖既有图。未重新执行正式训练、预处理或评价导出。
