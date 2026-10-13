@@ -1,0 +1,83 @@
+data:
+  raw_path: data/raw/N-CMAPSS_DS03-012.h5
+  hi_dev_path: data/raw/N-CMAPSS_DS03_cycle_dev.h5
+  hi_test_path: data/raw/N-CMAPSS_DS03_cycle_test.h5
+  processed_path: data/processed/ds03.pt
+  sensor_field: X_s
+  condition_field: W
+  sensor_dim: 14
+  condition_dim: 4
+  downsample_stride: 10
+  downsample_scope: unit
+  sample_scope: full_flight
+  normalization: minmax_0_1
+  normalization_fit: raw_dev_before_downsampling
+  normalization_clip: false
+model:
+  sensor_hidden_dim: 64
+  condition_hidden_dim: 32
+  gru_layers: 1
+  bidirectional: false
+  latent_i_dim: 8
+  latent_c_dim: 8
+  decoder_hidden_dims:
+  - 64
+  - 64
+  hi_hidden_dim: 16
+  decoder_use_w: true
+training:
+  seed: 42
+  device: auto
+  representation:
+    optimizer: Adam
+    learning_rate: 0.001
+    weight_decay: 0.0
+    batch_size: 16
+    epochs: 100
+    sigma_x_squared: 1.0
+    kl_i_weight: 1.0
+    kl_c_weight: 1.0
+    gradient_clip_norm: 5.0
+  hi:
+    optimizer: Adam
+    learning_rate: 0.001
+    weight_decay: 0.0
+    batch_size_pairs: 128
+    epochs: 100
+    min_cycle_gap: 5
+    kappa: 1.0
+    l2_coefficient: 0.0001
+    include_bias_in_l2: true
+    sampling: uniform_unit_then_uniform_valid_pair
+    pairs_per_epoch: N_train
+  checkpoint_selection: last_epoch
+  pipeline: joint
+  joint:
+    optimizer: Adam
+    learning_rate: 0.001
+    weight_decay: 0.0
+    batch_size: 16
+    epochs: 100
+    sigma_x_squared: 1.0
+    gradient_clip_norm: 5.0
+    kappa: 1.0
+    min_cycle_gap: 5
+    pairs_per_batch: 16
+    batch_scheme: grouped
+    units_per_batch: 4
+    flights_per_unit: 4
+    loss_weights:
+      reconstruction: 1.0
+      kl_i: 1.0
+      kl_c: 1.0
+      order: 10.0
+      l2: 0.0001
+smoke:
+  representation_max_flights: 32
+  representation_epochs: 3
+  hi_epochs: 3
+  joint_epochs: 3
+  joint_batches_per_epoch: 2
+  joint_flights_per_unit: 8
+output:
+  root: outputs/decoder_w

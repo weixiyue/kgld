@@ -454,17 +454,43 @@ def check_mechanisms(config, batch, pairs):
         for a, b in zip(posterior, model.encode(extended_x, extended_mask)):
             torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-6)
         mu_i, _, mu_c, _ = posterior
-        baseline = model.decode(mu_i, mu_c, time_positions(batch['mask']))
-        extended = model.decode(mu_i, mu_c, time_positions(extended_mask))
+        decoder_w = batch['w'].masked_fill(~batch['mask'][:, :, None], 0)
+        baseline = model.decode(mu_i, mu_c, time_positions(batch['mask']), decoder_w)
+        extended_w = F.pad(decoder_w, (0, 0, 0, 8), value=0)
+        extended = model.decode(mu_i, mu_c, time_positions(extended_mask), extended_w)
         torch.testing.assert_close(baseline[batch['mask']], extended[extended_mask], rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(model.predict_hi(batch['x'], batch['mask']), model.predict_hi(extended_x, extended_mask), rtol=1e-6, atol=1e-6)
+        changed_w = decoder_w + batch['mask'][:, :, None] * .25
+        changed = model.decode(mu_i, mu_c, time_positions(batch['mask']), changed_w)
+        if model.decoder_use_w:
+            assert not torch.equal(baseline[batch['mask']], changed[batch['mask']])
+        else:
+            torch.testing.assert_close(baseline, changed, rtol=0, atol=0)
+    devices = [batch['x'].device.index] if batch['x'].is_cuda else []
+    model.train()
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(42)
+        original = model(batch['x'], batch['w'], batch['mask'])
+        torch.manual_seed(42)
+        changed = model(batch['x'], batch['w'] + .25, batch['mask'])
+    for key in ('mu_i', 'logvar_i', 'mu_c', 'logvar_c'):
+        torch.testing.assert_close(original[key], changed[key], rtol=0, atol=0)
+    torch.testing.assert_close(torch.sigmoid(-model.hi_head(original['mu_i'])),
+                               torch.sigmoid(-model.hi_head(changed['mu_i'])), rtol=0, atol=0)
+    w_grad_norm = None
+    if model.decoder_use_w:
+        w_grad = torch.autograd.grad(losses['reconstruction'], model.decoder.layers[0].weight, retain_graph=True)[0][:, 16:20]
+        w_grad_norm = w_grad.double().norm().item()
+        assert torch.isfinite(w_grad).all() and w_grad_norm > 0
     assert torch.equal(batch['mask'], original_mask)
     assert (batch['unit'][pairs[:, 0]] == batch['unit'][pairs[:, 1]]).all()
     assert (batch['cycle'][pairs[:, 1]] - batch['cycle'][pairs[:, 0]] >= 5).all()
     assert order_loss(torch.tensor([0.]), torch.tensor([1.]), 1) < order_loss(torch.tensor([1.]), torch.tensor([0.]), 1)
     print(f'PASS: OCALD pair/mask/base-loss/path checks; encoder ranking gradient norm={norm:.9g}', flush=True)
     return {'initial_encoder_order_gradient_norm': norm, 'mask_padding_checked': True,
-            'order_only_decoder_prior_gradients_absent': True, 'pair_direction_checked': True}
+            'order_only_decoder_prior_gradients_absent': True, 'pair_direction_checked': True,
+            'decoder_use_w': model.decoder_use_w, 'w_independent_encode_hi_checked': True,
+            'decoder_w_input_gradient_norm': w_grad_norm}
 
 
 def representation_weights(config):
@@ -564,12 +590,13 @@ def train_joint(config, smoke):
         if not torch.isfinite(raw[split]).all():
             raise RuntimeError('Nonfinite final raw HI')
     scale = {'min':raw['dev'].min().item(),'max':raw['dev'].max().item(),'count':len(raw['dev']),'fit_split':'dev'}
-    saved = {'stage':'joint','training_mode':'joint','structure':config['model'],
+    saved = {'stage':'joint','training_mode':'joint','structure':{**config['model'], 'decoder_use_w':model.decoder_use_w},
              'mode':'smoke' if smoke else 'full','epoch':epochs,'seed':seed,'config':config,
              'loss_weights':weights,'actual_training':{**settings,'epochs':epochs,'seed':seed},
              'normalization':processed['normalization'],'columns':processed['columns'],
              'state_dict':{k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
              'initial_state_dict':initial,'initial_sha256':state_hash(initial),
+             'initialization_rule':'legacy_modules_then_isolated_decoder_input_layer' if model.decoder_use_w else 'legacy_default',
              'reparameterization_rng_digest':digest,'raw_hi':raw,'hi_minmax':scale,
              'flight_keys':{s:[[f['unit'],f['cycle']] for f in d.flights] for s,d in datasets.items()}}
     torch.save(saved,root/'checkpoint.pt')

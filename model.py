@@ -62,16 +62,31 @@ class ConditionalPrior(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, latent_i_dim, latent_c_dim, hidden_dims, output_dim):
         super().__init__()
+        self.use_w = False
+        self.condition_dim = 0
         self.layers = nn.Sequential(
             nn.Linear(latent_i_dim + latent_c_dim + 1, hidden_dims[0]), nn.ReLU(),
             nn.Linear(hidden_dims[0], hidden_dims[1]), nn.ReLU(),
             nn.Linear(hidden_dims[1], output_dim),
         )
 
-    def forward(self, z_i, z_c, positions):
+    def enable_w_input(self, condition_dim):
+        # Initialize only the resized layer, without advancing the common RNG.
+        with torch.random.fork_rng(devices=[]):
+            old = self.layers[0]
+            self.layers[0] = nn.Linear(old.in_features + condition_dim, old.out_features)
+        self.use_w = True
+        self.condition_dim = condition_dim
+
+    def forward(self, z_i, z_c, positions, w=None):
         latents = torch.cat((z_i, z_c), dim=-1)
-        inputs = torch.cat((latents[:, None, :].expand(-1, positions.shape[1], -1),
-                            positions[:, :, None]), dim=-1)
+        parts = [latents[:, None, :].expand(-1, positions.shape[1], -1)]
+        if self.use_w:
+            if w is None or w.shape != (*positions.shape, self.condition_dim):
+                raise ValueError('W-conditioned decoder requires aligned per-step W')
+            parts.append(w)
+        parts.append(positions[:, :, None])
+        inputs = torch.cat(parts, dim=-1)
         return self.layers(inputs)
 
 
@@ -93,18 +108,23 @@ class OCALD(nn.Module):
             "bidirectional": False, "latent_i_dim": 8, "latent_c_dim": 8,
             "decoder_hidden_dims": [64, 64], "hi_hidden_dim": 16,
         }
-        if m != approved:
+        self.decoder_use_w = m.get('decoder_use_w', False)
+        if not isinstance(self.decoder_use_w, bool):
+            raise ValueError('decoder_use_w must be boolean')
+        if {k: v for k, v in m.items() if k != 'decoder_use_w'} != approved:
             raise ValueError("Model settings differ from approved v2 structure")
         self.sensor_encoder = SensorEncoder(d["sensor_dim"], m["sensor_hidden_dim"], m["latent_i_dim"], m["latent_c_dim"])
         self.conditional_prior = ConditionalPrior(d["condition_dim"], m["condition_hidden_dim"], m["latent_c_dim"])
         self.decoder = Decoder(m["latent_i_dim"], m["latent_c_dim"], m["decoder_hidden_dims"], d["sensor_dim"])
         self.hi_head = HIHead(m["latent_i_dim"], m["hi_hidden_dim"])
+        if self.decoder_use_w:
+            self.decoder.enable_w_input(d['condition_dim'])
 
     def encode(self, x, mask):
         return self.sensor_encoder(x, mask)
 
-    def decode(self, z_i, z_c, positions):
-        return self.decoder(z_i, z_c, positions)
+    def decode(self, z_i, z_c, positions, w=None):
+        return self.decoder(z_i, z_c, positions, w)
 
     def predict_hi(self, x, mask):
         mu_i, _, _, _ = self.encode(x, mask)
@@ -115,6 +135,7 @@ class OCALD(nn.Module):
         prior_mu_c, prior_logvar_c = self.conditional_prior(w, mask)
         z_i = mu_i + torch.exp(0.5 * logvar_i) * torch.randn_like(mu_i)
         z_c = mu_c + torch.exp(0.5 * logvar_c) * torch.randn_like(mu_c)
-        reconstruction = self.decode(z_i, z_c, time_positions(mask, dtype=x.dtype))
+        decoder_w = w.masked_fill(~mask[:, :, None], 0) if self.decoder_use_w else None
+        reconstruction = self.decode(z_i, z_c, time_positions(mask, dtype=x.dtype), decoder_w)
         return {"mu_i": mu_i, "logvar_i": logvar_i, "mu_c": mu_c, "logvar_c": logvar_c,
                 "prior_mu_c": prior_mu_c, "prior_logvar_c": prior_logvar_c, "x_hat": reconstruction}
