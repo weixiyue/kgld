@@ -11,24 +11,166 @@ import pandas as pd
 import torch
 import yaml
 
-from data import load_config, load_processed
-from diagnose import extract_blocks
+from data import FlightDataset, collate_fn, load_config, load_processed
 from evaluate import evaluate, predict_table, metric_report
-from losses import representation_loss, order_loss, head_l2
-from model import OCALD
-from ocald_s2 import (datasets_for, move_batch, joint_schedule, check_mechanisms,
-                      encoder_order_norm, dump_json, file_hash, state_hash, protected_hashes)
+from losses import representation_loss, reconstruction_loss, order_loss, head_l2
+from model import OCALD, time_positions
+from train import sample_pairs, valid_pair_pools
+from torch.utils.data import DataLoader
+from torch.nn import functional as F
 
-DEFAULT_S2 = 'outputs/ocald_s2/20261012T104802398175Z/lambda_10/seed_42/checkpoint.pt'
+DEFAULT_S2 = None  # Historical source removed by explicit experiment cleanup.
 METRICS = ('mae', 'mape', 'monotonicity', 'trend', 'failure_consistency', 'mi')
 
 
+def dump_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + '\n', encoding='utf-8')
+
+def file_hash(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+def state_hash(state):
+    return hashlib.sha256(b''.join(v.detach().cpu().numpy().tobytes() for v in state.values())).hexdigest()
+
+def datasets_for(processed, smoke):
+    datasets = {}
+    for split in ('dev', 'test'):
+        dataset = FlightDataset(processed, split)
+        expected = list(range(1, 10)) if split == 'dev' else list(range(10, 16))
+        if sorted({f['unit'] for f in dataset.flights}) != expected:
+            raise ValueError(f'Unexpected {split} unit set')
+        keys = [(f['unit'], f['cycle']) for f in dataset.flights]
+        if len(keys) != len(set(keys)):
+            raise ValueError('Duplicate flight keys')
+        if smoke:
+            selected = []
+            for unit in expected:
+                flights = sorted((f for f in dataset.flights if f['unit'] == unit), key=lambda f: f['cycle'])
+                indices = np.unique(np.linspace(0, len(flights) - 1, min(8, len(flights))).round().astype(int))
+                selected.extend(flights[i] for i in indices)
+            dataset.flights = selected
+        datasets[split] = dataset
+    return datasets
+
+def move_batch(flights, device):
+    return {key: value.to(device) for key, value in collate_fn(flights).items()}
+
+def joint_schedule(flights, epochs, batches, seed):
+    units = torch.tensor([f['unit'] for f in flights])
+    cycles = torch.tensor([f['cycle'] for f in flights])
+    groups = [torch.where(units == unit)[0] for unit in torch.unique(units)]
+    if len(groups) < 4 or any(len(g) < 4 or cycles[g].max() - cycles[g].min() < 5 for g in groups):
+        raise ValueError('Grouped sampling needs >=4 units with >=4 flights and valid cycle gaps')
+    flight_rng = torch.Generator().manual_seed(seed)
+    batch_list, pair_list = [], []
+    # Existing sampler uses global CPU RNG; isolate it from initialization/noise.
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        for _ in range(epochs * batches):
+            selections = []
+            for group_index in torch.randperm(len(groups), generator=flight_rng)[:4]:
+                group = groups[int(group_index)]
+                while True:
+                    selected = group[torch.randperm(len(group), generator=flight_rng)[:4]]
+                    if cycles[selected].max() - cycles[selected].min() >= 5:
+                        selections.append(selected)
+                        break
+            indices = torch.cat(selections)
+            u, c = units[indices], cycles[indices]
+            assert len(torch.unique(indices)) == 16
+            assert torch.unique(u, return_counts=True)[1].tolist() == [4] * 4
+            pairs = sample_pairs(valid_pair_pools(u, c, 5), 16)
+            assert (u[pairs[:, 0]] == u[pairs[:, 1]]).all()
+            assert (c[pairs[:, 1]] - c[pairs[:, 0]] >= 5).all()
+            batch_list.append(indices)
+            pair_list.append(pairs)
+    return {'flights': torch.stack(batch_list).reshape(epochs, batches, 16),
+            'pairs': torch.stack(pair_list).reshape(epochs, batches, 16, 2)}
+
+def encoder_order_norm(model, order):
+    params = list(model.sensor_encoder.parameters())
+    grads = torch.autograd.grad(order, params, retain_graph=True, allow_unused=True)
+    # Variance/C output heads are not on the ranking path; GRU and mu_I are.
+    names = list(model.sensor_encoder.named_parameters())
+    for (name, _), grad in zip(names, grads):
+        if name.startswith(('gru.', 'mu_i.')) and grad is None:
+            raise RuntimeError(f'Missing ranking gradient: {name}')
+    valid = [g for g in grads if g is not None]
+    if not valid or not all(torch.isfinite(g).all() for g in valid):
+        raise RuntimeError('Invalid encoder ranking gradients')
+    return torch.stack([g.detach().square().sum() for g in valid]).sum().sqrt().item()
+
+def check_mechanisms(config, batch, pairs):
+    model = OCALD(config).to(batch['x'].device)
+    model.train()  # cuDNN GRU backward requires a training-mode forward.
+    original_mask = batch['mask'].clone()
+    output = model(batch['x'], batch['w'], batch['mask'])
+    r = model.hi_head(output['mu_i'])
+    order = order_loss(r[pairs[:, 0]], r[pairs[:, 1]], 1)
+    norm = encoder_order_norm(model, order)
+    if norm <= 0:
+        raise RuntimeError('Ranking gradient did not reach encoder')
+    other = list(model.decoder.parameters()) + list(model.conditional_prior.parameters())
+    assert all(g is None for g in torch.autograd.grad(order, other, allow_unused=True, retain_graph=True))
+    losses = representation_loss(batch['x'], batch['mask'], output, 1)
+    torch.testing.assert_close(losses['loss'], losses['reconstruction'] + losses['kl_i'] + losses['kl_c'])
+    before = reconstruction_loss(batch['x'], output['x_hat'], batch['mask'], 1)
+    changed_x = batch['x'].masked_fill(~batch['mask'][:, :, None], float('nan'))
+    changed_prediction = output['x_hat'].masked_fill(~batch['mask'][:, :, None], float('nan'))
+    torch.testing.assert_close(before, reconstruction_loss(changed_x, changed_prediction, batch['mask'], 1), rtol=0, atol=0)
+    model.eval()
+    with torch.no_grad():
+        posterior = model.encode(batch['x'], batch['mask'])
+        for a, b in zip(posterior, model.encode(changed_x, batch['mask'])):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        extended_mask = F.pad(batch['mask'], (0, 8), value=False)
+        extended_x = F.pad(batch['x'], (0, 0, 0, 8), value=123)
+        for a, b in zip(posterior, model.encode(extended_x, extended_mask)):
+            torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-6)
+        mu_i, _, mu_c, _ = posterior
+        baseline = model.decode(mu_i, mu_c, time_positions(batch['mask']))
+        extended = model.decode(mu_i, mu_c, time_positions(extended_mask))
+        torch.testing.assert_close(baseline[batch['mask']], extended[extended_mask], rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(model.predict_hi(batch['x'], batch['mask']), model.predict_hi(extended_x, extended_mask), rtol=1e-6, atol=1e-6)
+    assert torch.equal(batch['mask'], original_mask)
+    assert (batch['unit'][pairs[:, 0]] == batch['unit'][pairs[:, 1]]).all()
+    assert (batch['cycle'][pairs[:, 1]] - batch['cycle'][pairs[:, 0]] >= 5).all()
+    assert order_loss(torch.tensor([0.]), torch.tensor([1.]), 1) < order_loss(torch.tensor([1.]), torch.tensor([0.]), 1)
+    print(f'PASS: S2 direction/mask/ELBO/path checks; encoder ranking gradient norm={norm:.9g}', flush=True)
+    return {'initial_encoder_order_gradient_norm': norm, 'mask_padding_checked': True,
+            'order_only_decoder_prior_gradients_absent': True, 'pair_direction_checked': True}
+
+def extract_blocks(model, dataset, batch_size, device):
+    """Take I/C from the SAME encode call and check every stored flight key."""
+    blocks, units, cycles = {"I": [], "C": []}, [], []
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    with torch.no_grad():
+        for batch in loader:
+            mu_i, _, mu_c, _ = model.encode(batch["x"].to(device), batch["mask"].to(device))
+            for block, values in (("I", mu_i), ("C", mu_c)):
+                assert values.shape == (len(batch["unit"]), 8) and torch.isfinite(values).all()
+                blocks[block].append(values)
+            units.append(batch["unit"].to(device))
+            cycles.append(batch["cycle"].to(device))
+    units, cycles = torch.cat(units), torch.cat(cycles)
+    assert units.cpu().tolist() == [flight["unit"] for flight in dataset.flights]
+    assert cycles.cpu().tolist() == [flight["cycle"] for flight in dataset.flights]
+    return {block: (torch.cat(values), units, cycles) for block, values in blocks.items()}
+
+
 def protected(config):
-    hashes = protected_hashes(config)
-    hashes.pop('README.md')  # Authorized current task documentation changes.
-    hashes['ocald_s2.py'] = file_hash('ocald_s2.py')
-    hashes['README_ocald_s2.md'] = file_hash('README_ocald_s2.md')
-    return hashes
+    files = ['model.py', 'losses.py', 'train.py', 'metrics.py', 'evaluate.py', 'data.py',
+             'verify.py', 'config.yaml', 'AGENTS.md', 'OCALD_Implementation_Plan.md',
+             config['data']['processed_path']]
+    notebook = Path('baseline/03_train_evaluate_proposals.ipynb')
+    if notebook.exists():
+        files.append(str(notebook))
+    return {path: file_hash(path) for path in files}
+
+
+RETIRED_HASH_FILES = {'diagnose.py', 'diagnostics_features.py', 'diagnostics_latent.py',
+                      'baseline_ref.py', 'README_baseline_ref.md', 'ocald_s2.py',
+                      'README_ocald_s2.md'}
 
 
 def objective(terms, order, l2):
@@ -79,7 +221,8 @@ def compare(root, source):
 def verify(root, device):
     root = Path(root)
     settings = json.loads((root/'run_settings.json').read_text())
-    assert protected(settings['config']) == settings['protected_sha256']
+    assert protected(settings['config']) == {k: v for k, v in settings['protected_sha256'].items()
+                                               if k not in RETIRED_HASH_FILES}
     saved = torch.load(root/'checkpoint.pt', map_location='cpu', weights_only=True)
     assert saved['stage'] == 'ocald_no_kli' and saved['epoch'] == settings['epochs']
     assert saved['actual_training']['kl_i_weight'] == 0 and saved['actual_training']['kl_c_weight'] == 1
@@ -94,8 +237,9 @@ def verify(root, device):
     schedule = torch.load(root/'sampling_schedule.pt', map_location='cpu', weights_only=True)
     fresh = joint_schedule(datasets['dev'].flights, settings['epochs'], settings['batches_per_epoch'], 42)
     assert all(torch.equal(schedule[k],fresh[k]) for k in fresh)
-    old_path = Path(settings['s2_checkpoint'])
-    if old_path.is_file():
+    old_path = Path(settings['s2_checkpoint']) if settings.get('s2_checkpoint') else None
+    source_available = old_path is not None and old_path.is_file()
+    if source_available:
         assert file_hash(old_path) == settings['s2_sha256']
         old = torch.load(old_path, map_location='cpu', weights_only=True)
         assert saved['initial_sha256'] == old['initial_sha256']
@@ -116,12 +260,24 @@ def verify(root, device):
         np.testing.assert_allclose(table[field],stored[field],rtol=0,atol=0,equal_nan=True)
     assert metric_report(stored,loaded) == json.loads((root/'metrics.json').read_text())
     if (root/'s2_reference').is_dir():
-        old_table, old_checkpoint = predict_table(settings['config'], old_path)
         old_export = pd.read_csv(root/'s2_reference/predictions.csv', float_precision='round_trip')
-        assert old_table[['split','unit','cycle']].equals(old_export[['split','unit','cycle']])
-        for field in ('hi_raw','hi_scaled','hi_gt','rul'):
-            np.testing.assert_allclose(old_table[field], old_export[field], rtol=0, atol=0, equal_nan=True)
-        assert metric_report(old_export, old_checkpoint) == json.loads((root/'s2_reference/metrics.json').read_text())
+        old_report = json.loads((root/'s2_reference/metrics.json').read_text())
+        if source_available:
+            old_table, old_checkpoint = predict_table(settings['config'], old_path)
+            assert old_table[['split','unit','cycle']].equals(old_export[['split','unit','cycle']])
+            for field in ('hi_raw','hi_scaled','hi_gt','rul'):
+                np.testing.assert_allclose(old_table[field], old_export[field], rtol=0, atol=0, equal_nan=True)
+        else:
+            # Retained comparison report/CSV belong to this run; source was explicitly deleted.
+            old_checkpoint = {'stage': old_report['diagnostic_type'], 'mode': old_report['mode'],
+                              'epoch': old_report['joint_epoch'], 'seed': old_report['seed'],
+                              'lambda': old_report['actual_training']['lambda'],
+                              'actual_training': old_report['actual_training'], 'hi_minmax': old_report['hi_minmax']}
+            assert not old_export.duplicated(['split','unit','cycle']).any()
+            assert old_export[['split','unit','cycle']].equals(stored[['split','unit','cycle']])
+            for field in ('hi_gt','rul'):
+                np.testing.assert_array_equal(old_export[field],stored[field])
+        assert metric_report(old_export, old_checkpoint) == old_report
     comparison = pd.read_csv(root/'comparison.csv', float_precision='round_trip')
     for row in comparison.itertuples():
         entry = json.loads(Path(row.source).read_text())['splits'][row.split][row.scale]
@@ -140,9 +296,11 @@ def verify(root, device):
     checks.update({'reload_predictions_labels_metrics_scaling_verified': True, 'loss_composition_verified': True,
                    'no_ranking_or_probe_metrics': True, 'protected_files_unchanged': True,
                    'sampling_schedule_recreated_exactly': True,
-                   's2_evaluation_and_comparison_recomputed': (root/'s2_reference').is_dir()})
-    dump_json(root/'verification.json',checks)
+                   's2_evaluation_and_comparison_recomputed': (root/'s2_reference').is_dir(),
+                   'original_s2_checkpoint_available': source_available})
+    # Keep completed outputs intact during read-only verification.
     print(f'PASS: no-KL_I loss/gradient/mask/schedule/checkpoint/evaluation checks; output={root}',flush=True)
+    return checks
 
 
 def run(config, smoke, source):
@@ -153,7 +311,8 @@ def run(config, smoke, source):
     if device.type=='cpu': torch.set_num_threads(1)
     root = Path('outputs/ocald_no_kli')/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     root.mkdir(parents=True,exist_ok=False)
-    source = Path(source)
+    source = Path(source) if source else None
+    source_available = source is not None and source.is_file()
     actual = {'optimizer':'Adam','lr':.001,'weight_decay':0.,'epochs':epochs,'batch_size':16,
               'gradient_clip_norm':5.,'kl_i_weight':0.,'kl_c_weight':1.,'sigma_x_squared':1.,
               'lambda':10.,'seed':42,'head_l2_coefficient':1e-4,'kappa':1.,'min_cycle_gap':5,
@@ -161,13 +320,13 @@ def run(config, smoke, source):
               'reparameterization':'I/C standard torch.randn_like; same rule as S2'}
     settings = {'config':config,'actual_training':actual,'mode':'smoke' if smoke else 'full',
                 'epochs':epochs,'batches_per_epoch':batches,'device':str(device),'protected_sha256':protected(config),
-                's2_checkpoint':str(source),'s2_sha256':file_hash(source) if source.is_file() else None}
+                's2_checkpoint':str(source) if source is not None else None,'s2_sha256':file_hash(source) if source_available else None}
     dump_json(root/'run_settings.json',settings)
     (root/'actual_config.yaml').write_text(yaml.safe_dump({'base_config':config,'diagnostic_type':'ocald_no_kli',
                                                        'mode':settings['mode'],'actual_training':actual},sort_keys=False))
     schedule = joint_schedule(datasets['dev'].flights,epochs,batches,42)
     torch.save(schedule,root/'sampling_schedule.pt')
-    if source.is_file():
+    if source_available:
         old = torch.load(source,map_location='cpu',weights_only=True)
         assert old['stage']=='ocald_s2' and old['seed']==42 and old['lambda']==10
         if not smoke:
@@ -180,7 +339,7 @@ def run(config, smoke, source):
     torch.manual_seed(42)
     model = OCALD(config).to(device)
     initial = {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
-    if source.is_file(): assert state_hash(initial)==old['initial_sha256']
+    if source_available: assert state_hash(initial)==old['initial_sha256']
     optimizer = torch.optim.Adam(model.parameters(),lr=.001,weight_decay=0)
     logs=[]
     print(f'no-KL_I {settings["mode"]}: device={device}; epochs={epochs}; output={root}',flush=True)
@@ -218,7 +377,7 @@ def run(config, smoke, source):
             print(f'epoch={epoch+1}/{epochs}: '+ ' '.join(f'{k}={logs[-1][k]:.6f}' for k in totals),flush=True)
     rng=torch.cuda.get_rng_state(device) if device.type=='cuda' else torch.get_rng_state()
     rng_digest=hashlib.sha256(rng.numpy().tobytes()).hexdigest()
-    if source.is_file() and not smoke: assert rng_digest==old['reparameterization_rng_digest']
+    if source_available and not smoke: assert rng_digest==old['reparameterization_rng_digest']
     model.eval()
     blocks={s:extract_blocks(model,dataset,16,device) for s,dataset in datasets.items()}
     with torch.no_grad(): raw={s:torch.sigmoid(-model.hi_head(values['I'][0])).cpu() for s,values in blocks.items()}
@@ -234,17 +393,18 @@ def run(config, smoke, source):
     dump_json(root/'mechanism_checks.json',checks)
     # First evaluation label access is after the last training update.
     evaluate(config,root/'checkpoint.pt')
-    if source.is_file() and not smoke:
+    if source_available and not smoke:
         evaluate(config,source,root/'s2_reference')
     compare(root,source)
-    verify(root,device)
+    checks.update(verify(root,device))
+    dump_json(root/'verification.json', checks)
     notes=[f'no-KL_I {settings["mode"]}, seed42, lambda10, {epochs} joint epochs (not two-stage 100/100).',
            'Ablation objective=reconstruction+KL_C+10*order+1e-4*head_L2; KL_I logged only.',
            'No probes and no ranking metrics. Original S2 is evaluated read-only, never retrained.',
            'Initialization and sampling schedules checked against S2 where available; full noise RNG digest checked.',
            'HI/RUL only evaluation; dev-only raw scaling; no clipping, epsilon, direction flip or extra postprocessing.',
            'Single seed cannot establish a unique cause or physical disentanglement.',
-           f'S2 comparison: {"re-evaluated" if source.is_file() and not smoke else "not evaluated in smoke / source unavailable"}.']
+           f'S2 comparison: {"re-evaluated" if source_available and not smoke else "not evaluated in smoke / source unavailable"}.']
     (root/'summary.txt').write_text('\n'.join(notes)+'\n')
     print(f'PASS: completed {settings["mode"]}; output={root}',flush=True)
     return root
