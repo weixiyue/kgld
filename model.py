@@ -105,18 +105,23 @@ class OCALD(nn.Module):
         m, d = config["model"], config["data"]
         approved = {
             "sensor_hidden_dim": 64, "condition_hidden_dim": 32, "gru_layers": 1,
-            "bidirectional": False, "latent_i_dim": 8, "latent_c_dim": 8,
+            "bidirectional": False, "latent_i_dim": m["latent_i_dim"], "latent_c_dim": 8,
             "decoder_hidden_dims": [64, 64], "hi_hidden_dim": 16,
         }
+        self.score_mode = m.get('score_mode', 'hi_head')
+        if self.score_mode not in ('hi_head', 'scalar_i'):
+            raise ValueError('Unknown score_mode')
+        if m['latent_i_dim'] != (1 if self.score_mode == 'scalar_i' else 8):
+            raise ValueError('score_mode and latent_i_dim mismatch')
         self.decoder_use_w = m.get('decoder_use_w', False)
         if not isinstance(self.decoder_use_w, bool):
             raise ValueError('decoder_use_w must be boolean')
-        if {k: v for k, v in m.items() if k != 'decoder_use_w'} != approved:
+        if {k: v for k, v in m.items() if k not in ('decoder_use_w', 'score_mode')} != approved:
             raise ValueError("Model settings differ from approved v2 structure")
         self.sensor_encoder = SensorEncoder(d["sensor_dim"], m["sensor_hidden_dim"], m["latent_i_dim"], m["latent_c_dim"])
         self.conditional_prior = ConditionalPrior(d["condition_dim"], m["condition_hidden_dim"], m["latent_c_dim"])
         self.decoder = Decoder(m["latent_i_dim"], m["latent_c_dim"], m["decoder_hidden_dims"], d["sensor_dim"])
-        self.hi_head = HIHead(m["latent_i_dim"], m["hi_hidden_dim"])
+        self.hi_head = HIHead(m["latent_i_dim"], m["hi_hidden_dim"]) if self.score_mode == "hi_head" else None
         if self.decoder_use_w:
             self.decoder.enable_w_input(d['condition_dim'])
 
@@ -126,9 +131,16 @@ class OCALD(nn.Module):
     def decode(self, z_i, z_c, positions, w=None):
         return self.decoder(z_i, z_c, positions, w)
 
+    def score(self, mu_i):
+        return mu_i.squeeze(-1) if self.score_mode == "scalar_i" else self.hi_head(mu_i)
+
+    def predict_score(self, x, mask):
+        return self.score(self.encode(x, mask)[0])
+
     def predict_hi(self, x, mask):
-        mu_i, _, _, _ = self.encode(x, mask)
-        return torch.sigmoid(-self.hi_head(mu_i))
+        if self.score_mode == "scalar_i":
+            raise ValueError("Scalar I HI requires dev score_minmax; use predict_score and scale_score")
+        return torch.sigmoid(-self.predict_score(x, mask))
 
     def forward(self, x, w, mask):
         mu_i, logvar_i, mu_c, logvar_c = self.encode(x, mask)

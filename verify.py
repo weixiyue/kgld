@@ -510,7 +510,8 @@ def verify_evaluation(config, run_dir):
     with (run_dir / "metrics.json").open(encoding="utf-8") as stream:
         report = json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"Invalid JSON constant: {value}")))
     fresh, checkpoint = predict_table(config, run_dir / "ocald.pt")
-    check(set(table.columns) == {"split", "unit", "cycle", "hi_raw", "hi_scaled", "hi_gt", "rul"}, "Prediction columns differ")
+    check(set(table.columns) in ({"split", "unit", "cycle", "hi_raw", "hi_scaled", "hi_gt", "rul"},
+                                {"split", "unit", "cycle", "hi_raw", "hi_scaled", "hi_gt", "rul", "hi_score", "hi_score_scaled"}), "Prediction columns differ")
     keys = ["split", "unit", "cycle"]
     check(not table.duplicated(keys).any(), "Duplicate prediction keys")
     table = table.sort_values(keys).reset_index(drop=True)
@@ -518,7 +519,8 @@ def verify_evaluation(config, run_dir):
     check(table[keys].equals(fresh[keys]) and len(table) == len(fresh), "CSV rows/keys differ from actual flights")
     for field in ("hi_raw", "hi_scaled", "hi_gt", "rul"):
         np.testing.assert_allclose(table[field], fresh[field], rtol=0, atol=0, equal_nan=True)
-    check(report == metric_report(table, checkpoint), "Exported metrics differ from CSV data")
+    recomputed = metric_report(table, checkpoint)
+    check(report == {key: recomputed[key] for key in report}, "Exported metrics differ from CSV data")
     if checkpoint["hi_minmax"]["min"] != checkpoint["hi_minmax"]["max"]:
         expected = scale_hi(torch.tensor(table.hi_raw.to_numpy()), checkpoint["hi_minmax"]).numpy()
         np.testing.assert_allclose(table.hi_scaled, expected, rtol=1e-6, atol=1e-7)
@@ -623,35 +625,51 @@ def verify_pipeline(config, checkpoint_path=None):
     pairs = schedule['pairs'][0,0].to(device)
     torch.manual_seed(42)
     model = OCALD(config).to(device).train()
-    output = model(batch['x'], batch['w'], batch['mask'])
-    scores = model.hi_head(output['mu_i'])
-    for ki in (0., 1.):
-        weights = {'reconstruction':1., 'kl_i':ki, 'kl_c':1., 'order':10., 'l2':1e-4}
-        terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
-                              r_early=scores[pairs[:,0]],r_late=scores[pairs[:,1]])
-        expected = terms['reconstruction']+ki*terms['kl_i']+terms['kl_c']+10*terms['order']+1e-4*terms['l2']
-        torch.testing.assert_close(terms['loss'],expected,rtol=1e-6,atol=1e-5)
-        assert terms['kl_i'].item() > 0
-        if ki == 0:
-            assert torch.autograd.grad(terms['loss'],terms['kl_i'],allow_unused=True,retain_graph=True)[0] is None
-        grads = torch.autograd.grad(terms['loss'],tuple(model.conditional_prior.parameters()),retain_graph=True)
-        assert all(torch.isfinite(g).all() for g in grads) and sum(g.square().sum().item() for g in grads)>0
-        assert encoder_order_norm(model,terms['order']) > 0
-    stage1 = training_loss(model.hi_head,representation_weights(config),x=batch['x'],mask=batch['mask'],output=output)
-    torch.testing.assert_close(stage1['loss'],representation_loss(batch['x'],batch['mask'],output,1.)['loss'],rtol=0,atol=0)
-    changed_x = batch['x'].masked_fill(~batch['mask'][:,:,None],float('nan'))
-    changed_hat = output['x_hat'].masked_fill(~batch['mask'][:,:,None],float('nan'))
-    torch.testing.assert_close(reconstruction_loss(changed_x,changed_hat,batch['mask'],1.),
-                               reconstruction_loss(batch['x'],output['x_hat'],batch['mask'],1.),rtol=0,atol=0)
-    model.zero_grad(set_to_none=True)
-    freeze_representation(model)
-    with torch.no_grad():
-        mean = model.encode(batch['x'],batch['mask'])[0]
-    r = model.hi_head(mean)
-    stage2 = training_loss(model.hi_head,hi_weights(config),r_early=r[pairs[:,0]],r_late=r[pairs[:,1]])
-    stage2['loss'].backward()
-    assert all(p.grad is None and not p.requires_grad for name in ('sensor_encoder','conditional_prior','decoder') for p in getattr(model,name).parameters())
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.hi_head.parameters())
+    if model.score_mode == 'scalar_i':
+        from train import check_mechanisms, fit_score_scale, scale_score
+        check_mechanisms(config, batch, pairs)
+        dev = torch.tensor([2., 4., 6.], device=device)
+        params = fit_score_scale(dev)
+        torch.testing.assert_close(scale_score(torch.tensor([0., 8.], device=device), params),
+                                   torch.tensor([1.5, -.5], device=device))
+        assert params == fit_score_scale(dev)  # Test predictions never enter fit.
+        assert not fit_score_scale(torch.ones(3, device=device))['available']
+        try:
+            scale_score(dev, fit_score_scale(torch.ones(3, device=device)))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Zero range must fail explicitly')
+    else:
+        output = model(batch['x'], batch['w'], batch['mask'])
+        scores = model.hi_head(output['mu_i'])
+        for ki in (0., 1.):
+            weights = {'reconstruction':1., 'kl_i':ki, 'kl_c':1., 'order':10., 'l2':1e-4}
+            terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
+                                  r_early=scores[pairs[:,0]],r_late=scores[pairs[:,1]])
+            expected = terms['reconstruction']+ki*terms['kl_i']+terms['kl_c']+10*terms['order']+1e-4*terms['l2']
+            torch.testing.assert_close(terms['loss'],expected,rtol=1e-6,atol=1e-5)
+            assert terms['kl_i'].item() > 0
+            if ki == 0:
+                assert torch.autograd.grad(terms['loss'],terms['kl_i'],allow_unused=True,retain_graph=True)[0] is None
+            grads = torch.autograd.grad(terms['loss'],tuple(model.conditional_prior.parameters()),retain_graph=True)
+            assert all(torch.isfinite(g).all() for g in grads) and sum(g.square().sum().item() for g in grads)>0
+            assert encoder_order_norm(model,terms['order']) > 0
+        stage1 = training_loss(model.hi_head,representation_weights(config),x=batch['x'],mask=batch['mask'],output=output)
+        torch.testing.assert_close(stage1['loss'],representation_loss(batch['x'],batch['mask'],output,1.)['loss'],rtol=0,atol=0)
+        changed_x = batch['x'].masked_fill(~batch['mask'][:,:,None],float('nan'))
+        changed_hat = output['x_hat'].masked_fill(~batch['mask'][:,:,None],float('nan'))
+        torch.testing.assert_close(reconstruction_loss(changed_x,changed_hat,batch['mask'],1.),
+                                   reconstruction_loss(batch['x'],output['x_hat'],batch['mask'],1.),rtol=0,atol=0)
+        model.zero_grad(set_to_none=True)
+        freeze_representation(model)
+        with torch.no_grad():
+            mean = model.encode(batch['x'],batch['mask'])[0]
+        r = model.hi_head(mean)
+        stage2 = training_loss(model.hi_head,hi_weights(config),r_early=r[pairs[:,0]],r_late=r[pairs[:,1]])
+        stage2['loss'].backward()
+        assert all(p.grad is None and not p.requires_grad for name in ('sensor_encoder','conditional_prior','decoder') for p in getattr(model,name).parameters())
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.hi_head.parameters())
     if checkpoint_path is not None:
         restored,saved = load_ocald(checkpoint_path,device)
         prepared = load_processed(saved['config'])
@@ -672,7 +690,13 @@ def verify_pipeline(config, checkpoint_path=None):
             assert all(torch.equal(plan[key],fresh[key]) for key in fresh)
         means,_,_ = extract_training_means(restored,data,16,device)
         with torch.no_grad():
-            raw = torch.sigmoid(-restored.hi_head(means)).cpu()
+            device_score = restored.score(means)
+            score = device_score.cpu()
+            raw = score if restored.score_mode == 'scalar_i' else torch.sigmoid(-device_score).cpu()
+        if 'scores' in saved:
+            torch.testing.assert_close(score, saved['scores']['dev'], rtol=0, atol=0)
+            from train import fit_score_scale
+            assert fit_score_scale(score) == saved['score_minmax']
         recorded = saved['verification']['train_hi_raw'] if saved['stage']=='hi' else saved['raw_hi']['dev']
         torch.testing.assert_close(raw,recorded,rtol=0,atol=0)
         assert saved['hi_minmax'] == {'min':raw.min().item(),'max':raw.max().item(),'count':len(data),'fit_split':'dev'}
@@ -681,9 +705,22 @@ def verify_pipeline(config, checkpoint_path=None):
             fresh,loaded = predict_table(None,checkpoint_path)
             disk = pd.read_csv(predictions_path,float_precision='round_trip')
             assert fresh[['split','unit','cycle']].equals(disk[['split','unit','cycle']])
-            for field in ('hi_raw','hi_scaled','hi_gt','rul'):
-                np.testing.assert_allclose(fresh[field],disk[field],rtol=0,atol=0,equal_nan=True)
-            assert metric_report(disk,loaded) == json.loads(Path(checkpoint_path).with_name('metrics.json').read_text())
+            for field in ('hi_raw','hi_scaled','hi_gt','rul', 'hi_score', 'hi_score_scaled'):
+                if field in disk:
+                    np.testing.assert_allclose(fresh[field],disk[field],rtol=0,atol=0,equal_nan=True)
+            if 'hi_score_scaled' in disk:
+                from train import fit_score_scale, scale_score
+                scale = fit_score_scale(torch.tensor(disk.loc[disk.split == 'dev', 'hi_score'].to_numpy()))
+                assert scale == loaded['score_minmax']
+                if scale['available']:
+                    expected = scale_score(torch.tensor(disk.hi_score.to_numpy()), scale).numpy()
+                    np.testing.assert_allclose(expected, disk.hi_score_scaled, rtol=1e-6, atol=1e-7)
+                else:
+                    assert disk.hi_score_scaled.isna().all()
+            report = metric_report(disk,loaded)
+            recorded_report = json.loads(Path(checkpoint_path).with_name('metrics.json').read_text())
+            # New metadata must not invalidate historical two-scale reports.
+            assert {key: report[key] for key in recorded_report} == recorded_report
     print('PASS: unified pipeline loss weights, zero-weight recording/path, mask, freeze, initialization, schedule, checkpoint and evaluation')
 
 

@@ -63,7 +63,10 @@ def training_loss(head, weights, *, x=None, mask=None, output=None,
     keys = ('reconstruction', 'kl_i', 'kl_c', 'order', 'l2')
     if set(weights) != set(keys) or any(not torch.isfinite(torch.tensor(v)) or v < 0 for v in weights.values()):
         raise ValueError('Loss weights must specify five finite nonnegative coefficients')
-    zero = next(head.parameters()).new_zeros(())
+    if head is None and weights["l2"] != 0:
+        raise ValueError("No HIHead: l2 weight must be zero")
+    reference = output["mu_i"] if output is not None else r_early
+    zero = next(head.parameters()).new_zeros(()) if head is not None else reference.new_zeros(())
     terms = dict.fromkeys(keys, zero)
     active = []
     if output is not None:
@@ -77,7 +80,7 @@ def training_loss(head, weights, *, x=None, mask=None, output=None,
         terms['order'] = order_loss(r_early, r_late, kappa)
     elif weights['order']:
         raise ValueError('A nonzero order weight requires valid pairs')
-    terms['l2'] = head_l2(head)
+    terms['l2'] = head_l2(head) if head is not None else zero
     for key in ('order', 'l2'):
         if weights[key]:
             active.append(weights[key] * terms[key])

@@ -62,6 +62,8 @@ def load_representation(path, device):
 
 def train_representation(config, smoke):
     validate_representation_config(config)
+    if config['model'].get('score_mode', 'hi_head') != 'hi_head':
+        raise ValueError('Scalar I supports joint training only')
     seed = config["training"]["seed"]
     random.seed(seed)
     np.random.seed(seed)
@@ -229,6 +231,8 @@ def sample_pairs(pools, count):
 def load_ocald(path, device):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     stage = checkpoint['stage']
+    if checkpoint.get('score_mode', 'hi_head') != checkpoint['config']['model'].get('score_mode', 'hi_head'):
+        raise ValueError('Checkpoint score_mode mismatch')
     if stage == 'hi':
         validate_hi_config(checkpoint['config'])
     elif stage == 'joint':
@@ -246,6 +250,19 @@ def load_ocald(path, device):
     return model, checkpoint
 
 
+def fit_score_scale(scores):
+    if scores.ndim != 1 or not len(scores) or not torch.isfinite(scores).all():
+        raise ValueError('Score scale needs finite dev predictions')
+    return {'min': scores.min().item(), 'max': scores.max().item(),
+            'count': len(scores), 'fit_split': 'dev', 'available': scores.max().item() != scores.min().item()}
+
+
+def scale_score(scores, parameters):
+    if parameters['fit_split'] != 'dev' or parameters['max'] == parameters['min']:
+        raise ValueError('Dev score range is zero or invalid; score-scaled HI unavailable')
+    return (parameters['max'] - scores) / (parameters['max'] - parameters['min'])
+
+
 def scale_hi(hi_raw, parameters):
     if parameters["max"] == parameters["min"]:
         raise ValueError("Training HI range is zero; scaled HI is unavailable")
@@ -254,6 +271,8 @@ def scale_hi(hi_raw, parameters):
 
 def train_hi(config, representation_path, smoke):
     validate_hi_config(config)
+    if config['model'].get('score_mode', 'hi_head') != 'hi_head':
+        raise ValueError('Scalar I supports joint training only')
     seed = config["training"]["seed"]
     random.seed(seed)
     np.random.seed(seed)
@@ -431,8 +450,11 @@ def check_mechanisms(config, batch, pairs):
     model.train()  # cuDNN GRU backward requires a training-mode forward.
     original_mask = batch['mask'].clone()
     output = model(batch['x'], batch['w'], batch['mask'])
-    r = model.hi_head(output['mu_i'])
+    r = model.score(output['mu_i'])
     order = order_loss(r[pairs[:, 0]], r[pairs[:, 1]], 1)
+    if model.score_mode == 'scalar_i':
+        assert model.hi_head is None and output['mu_i'].shape == (len(r), 1)
+        torch.testing.assert_close(r, output['mu_i'].squeeze(-1), rtol=0, atol=0)
     norm = encoder_order_norm(model, order)
     if norm <= 0:
         raise RuntimeError('Ranking gradient did not reach encoder')
@@ -440,6 +462,22 @@ def check_mechanisms(config, batch, pairs):
     assert all(g is None for g in torch.autograd.grad(order, other, allow_unused=True, retain_graph=True))
     losses = representation_loss(batch['x'], batch['mask'], output, 1)
     torch.testing.assert_close(losses['loss'], losses['reconstruction'] + losses['kl_i'] + losses['kl_c'])
+    for term, module in (('kl_i', model.sensor_encoder.mu_i), ('kl_c', model.conditional_prior)):
+        grads = torch.autograd.grad(losses[term], tuple(module.parameters()), retain_graph=True)
+        assert all(torch.isfinite(g).all() for g in grads) and sum(g.square().sum().item() for g in grads) > 0
+    weighted = training_loss(model.hi_head, config['training']['joint']['loss_weights'],
+        x=batch['x'], mask=batch['mask'], output=output, r_early=r[pairs[:, 0]], r_late=r[pairs[:, 1]])
+    weights = config['training']['joint']['loss_weights']
+    expected = sum(weights[key] * weighted[key] for key in weights)
+    torch.testing.assert_close(weighted['loss'], expected, rtol=1e-6, atol=1e-5)
+    if model.score_mode == 'scalar_i':
+        # Compare gradients, since the legacy flight-summed objective computes
+        # its sum before means and the logged KL means are sibling tensors.
+        params = tuple(model.sensor_encoder.parameters()) + tuple(model.conditional_prior.parameters())
+        actual_grads = torch.autograd.grad(weighted['loss'], params, retain_graph=True)
+        expected_grads = torch.autograd.grad(expected, params, retain_graph=True)
+        for actual, reference in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-5)
     before = reconstruction_loss(batch['x'], output['x_hat'], batch['mask'], 1)
     changed_x = batch['x'].masked_fill(~batch['mask'][:, :, None], float('nan'))
     changed_prediction = output['x_hat'].masked_fill(~batch['mask'][:, :, None], float('nan'))
@@ -459,7 +497,7 @@ def check_mechanisms(config, batch, pairs):
         extended_w = F.pad(decoder_w, (0, 0, 0, 8), value=0)
         extended = model.decode(mu_i, mu_c, time_positions(extended_mask), extended_w)
         torch.testing.assert_close(baseline[batch['mask']], extended[extended_mask], rtol=1e-6, atol=1e-6)
-        torch.testing.assert_close(model.predict_hi(batch['x'], batch['mask']), model.predict_hi(extended_x, extended_mask), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(model.predict_score(batch['x'], batch['mask']), model.predict_score(extended_x, extended_mask), rtol=1e-6, atol=1e-6)
         changed_w = decoder_w + batch['mask'][:, :, None] * .25
         changed = model.decode(mu_i, mu_c, time_positions(batch['mask']), changed_w)
         if model.decoder_use_w:
@@ -475,11 +513,11 @@ def check_mechanisms(config, batch, pairs):
         changed = model(batch['x'], batch['w'] + .25, batch['mask'])
     for key in ('mu_i', 'logvar_i', 'mu_c', 'logvar_c'):
         torch.testing.assert_close(original[key], changed[key], rtol=0, atol=0)
-    torch.testing.assert_close(torch.sigmoid(-model.hi_head(original['mu_i'])),
-                               torch.sigmoid(-model.hi_head(changed['mu_i'])), rtol=0, atol=0)
+    torch.testing.assert_close(model.score(original['mu_i']),
+                               model.score(changed['mu_i']), rtol=0, atol=0)
     w_grad_norm = None
     if model.decoder_use_w:
-        w_grad = torch.autograd.grad(losses['reconstruction'], model.decoder.layers[0].weight, retain_graph=True)[0][:, 16:20]
+        w_grad = torch.autograd.grad(losses['reconstruction'], model.decoder.layers[0].weight, retain_graph=True)[0][:, config['model']['latent_i_dim'] + config['model']['latent_c_dim']:][:, :config['data']['condition_dim']]
         w_grad_norm = w_grad.double().norm().item()
         assert torch.isfinite(w_grad).all() and w_grad_norm > 0
     assert torch.equal(batch['mask'], original_mask)
@@ -490,7 +528,9 @@ def check_mechanisms(config, batch, pairs):
     return {'initial_encoder_order_gradient_norm': norm, 'mask_padding_checked': True,
             'order_only_decoder_prior_gradients_absent': True, 'pair_direction_checked': True,
             'decoder_use_w': model.decoder_use_w, 'w_independent_encode_hi_checked': True,
-            'decoder_w_input_gradient_norm': w_grad_norm}
+            'decoder_w_input_gradient_norm': w_grad_norm, 'score_mode': model.score_mode,
+            'both_kl_gradients_and_unit_weights_checked': True,
+            'scalar_same_forward_no_detach_no_head_checked': model.score_mode == 'scalar_i'}
 
 
 def representation_weights(config):
@@ -507,6 +547,9 @@ def validate_joint_config(config):
     if 'joint' not in config['training']:
         raise ValueError('Joint training requires a training.joint configuration')
     settings = config['training']['joint']
+    if config['model'].get('score_mode', 'hi_head') == 'scalar_i':
+        if not config['model'].get('decoder_use_w') or settings['loss_weights'] != dict(reconstruction=1., kl_i=1., kl_c=1., order=10., l2=0.):
+            raise ValueError('Scalar I requires W decoder and approved loss weights')
     expected = {'optimizer': 'Adam', 'learning_rate': .001, 'weight_decay': 0., 'batch_size': 16,
                 'epochs': 100, 'sigma_x_squared': 1., 'gradient_clip_norm': 5., 'kappa': 1.,
                 'min_cycle_gap': 5, 'pairs_per_batch': 16, 'batch_scheme': 'grouped',
@@ -559,7 +602,7 @@ def train_joint(config, smoke):
             pairs = cpu_pairs.to(device)
             optimizer.zero_grad(set_to_none=True)
             output = model(batch['x'],batch['w'],batch['mask'])
-            r = model.hi_head(output['mu_i'])
+            r = model.score(output['mu_i'])
             terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
                                   r_early=r[pairs[:,0]],r_late=r[pairs[:,1]],
                                   sigma_x_squared=settings['sigma_x_squared'],kappa=settings['kappa'])
@@ -582,21 +625,28 @@ def train_joint(config, smoke):
     rng = torch.cuda.get_rng_state(device) if device.type == 'cuda' else torch.get_rng_state()
     digest = hashlib.sha256(rng.numpy().tobytes()).hexdigest()
     model.eval()
-    raw = {}
+    raw, scores = {}, {}
     for split,dataset in datasets.items():
         means,_,_ = extract_training_means(model,dataset,16,device)
         with torch.no_grad():
-            raw[split] = torch.sigmoid(-model.hi_head(means)).cpu()
+            device_scores = model.score(means)
+            scores[split] = device_scores.cpu()
+            raw[split] = scores[split] if model.score_mode == 'scalar_i' else torch.sigmoid(-device_scores).cpu()
         if not torch.isfinite(raw[split]).all():
             raise RuntimeError('Nonfinite final raw HI')
     scale = {'min':raw['dev'].min().item(),'max':raw['dev'].max().item(),'count':len(raw['dev']),'fit_split':'dev'}
-    saved = {'stage':'joint','training_mode':'joint','structure':{**config['model'], 'decoder_use_w':model.decoder_use_w},
+    score_scale = fit_score_scale(scores['dev'])
+    saved = {'score_mode': model.score_mode, 'scores': scores, 'score_minmax': score_scale,
+             'stage':'joint','training_mode':'joint','structure':{**config['model'], 'decoder_use_w':model.decoder_use_w, 'score_mode':model.score_mode},
              'mode':'smoke' if smoke else 'full','epoch':epochs,'seed':seed,'config':config,
              'loss_weights':weights,'actual_training':{**settings,'epochs':epochs,'seed':seed},
              'normalization':processed['normalization'],'columns':processed['columns'],
              'state_dict':{k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
              'initial_state_dict':initial,'initial_sha256':state_hash(initial),
-             'initialization_rule':'legacy_modules_then_isolated_decoder_input_layer' if model.decoder_use_w else 'legacy_default',
+             'initialization_rule':'pytorch_defaults_scalar_no_head_then_isolated_w_layer' if model.score_mode == 'scalar_i' else 'legacy_modules_then_isolated_decoder_input_layer' if model.decoder_use_w else 'legacy_default',
+             'sampling_rule':'CPU seed42 flight generator; independent CPU seed42 uniform-unit/valid-pair RNG; saved schedule',
+             'reparameterization_rule':'torch seed42 after mechanism checks; default initialization then per-forward randn_like for I and C; architecture-dependent RNG consumption',
+             'raw_hi_kind':'score' if model.score_mode == 'scalar_i' else 'sigmoid_hi',
              'reparameterization_rng_digest':digest,'raw_hi':raw,'hi_minmax':scale,
              'flight_keys':{s:[[f['unit'],f['cycle']] for f in d.flights] for s,d in datasets.items()}}
     torch.save(saved,root/'checkpoint.pt')
@@ -605,7 +655,10 @@ def train_joint(config, smoke):
     for split,dataset in datasets.items():
         means,_,_ = extract_training_means(restored,dataset,16,device)
         with torch.no_grad():
-            torch.testing.assert_close(torch.sigmoid(-restored.hi_head(means)).cpu(),raw[split],rtol=0,atol=0)
+            device_score = restored.score(means)
+            score = device_score.cpu()
+            torch.testing.assert_close(score, scores[split], rtol=0, atol=0)
+            torch.testing.assert_close(score if restored.score_mode == 'scalar_i' else torch.sigmoid(-device_score).cpu(), raw[split], rtol=0, atol=0)
     print(f'PASS: joint last checkpoint exact reload; checkpoint={root/"checkpoint.pt"}',flush=True)
     return root/'checkpoint.pt'
 

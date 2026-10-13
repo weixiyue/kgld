@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from data import FlightDataset, load_config, load_processed, read_reference, read_rul
-from train import extract_training_means, load_ocald, scale_hi
+from train import extract_training_means, load_ocald, scale_hi, fit_score_scale, scale_score
 
 
 def attach_references(predictions, hi, rul):
@@ -47,6 +47,8 @@ def predict_table(config=None, checkpoint_path=None):
     parameters = checkpoint["hi_minmax"]
     scaled_available = parameters["max"] != parameters["min"]
     tables = []
+    scalar = model.score_mode == "scalar_i"
+    score_parameters = None
     for split in ("dev", "test"):
         dataset = FlightDataset(processed, split)
         if diagnostic and "flight_keys" in checkpoint:
@@ -57,18 +59,27 @@ def predict_table(config=None, checkpoint_path=None):
             dataset.flights = [lookup[key] for key in keys]
         means, units, cycles = extract_training_means(model, dataset, config["training"]["representation"]["batch_size"], device)
         with torch.no_grad():
-            raw = torch.sigmoid(-model.hi_head(means)).cpu()
+            device_scores = model.score(means)
+            scores = device_scores.cpu()
+            raw = scores if scalar else torch.sigmoid(-device_scores).cpu()
         in_range = ((raw >= 0) & (raw <= 1)) if diagnostic else ((raw > 0) & (raw < 1))
-        if not torch.isfinite(raw).all() or not in_range.all():
+        if not torch.isfinite(raw).all() or (not scalar and not in_range.all()):
             raise ValueError(f"Invalid raw HI in {split}")
         if split == "dev":
             stored = checkpoint["raw_hi"]["dev"] if diagnostic else checkpoint["verification"]["train_hi_raw"]
             torch.testing.assert_close(raw, stored, rtol=1e-6, atol=1e-7)
             if parameters != {"min": stored.min().item(), "max": stored.max().item(), "count": len(dataset), "fit_split": "dev"}:
                 raise ValueError("HI scale is not fitted on all training predictions")
-        scaled = scale_hi(raw, parameters).numpy() if scaled_available else np.full(len(raw), np.nan)
+        if split == 'dev':
+            score_parameters = fit_score_scale(scores)
+            if 'score_minmax' in checkpoint and checkpoint['score_minmax'] != score_parameters:
+                raise ValueError('Checkpoint score scale differs from dev-only predictions')
+            checkpoint = {**checkpoint, 'score_minmax': score_parameters, 'score_mode': model.score_mode}
+        score_scaled = scale_score(scores, score_parameters).numpy() if score_parameters['available'] else np.full(len(scores), np.nan)
+        scaled = np.full(len(raw), np.nan) if scalar else (scale_hi(raw, parameters).numpy() if scaled_available else np.full(len(raw), np.nan))
         predictions = pd.DataFrame({"split": split, "unit": units.cpu().numpy(), "cycle": cycles.cpu().numpy(),
-                                    "hi_raw": raw.numpy(), "hi_scaled": scaled})
+                                    "hi_raw": raw.numpy(), "hi_scaled": scaled, "hi_score": scores.numpy(),
+                                    "hi_score_scaled": score_scaled})
         hi = read_reference(config["data"][f"hi_{split}_path"], processed[split])
         rul = read_rul(config["data"]["raw_path"], split, processed[split])
         if diagnostic and "flight_keys" in checkpoint:
@@ -95,12 +106,20 @@ def metric_report(table, checkpoint):
               "hi_epoch": checkpoint["epoch"], "representation_epoch": checkpoint["source_epoch"],
               "seed": checkpoint["config"]["training"]["seed"], "hi_minmax": checkpoint["hi_minmax"],
               "reference_commit": "157ebfae7baeee1e0cd52180f8e58ead3dcb448e", "splits": {}}
+    result.update(score_mode=checkpoint.get("score_mode", "hi_head"), score_minmax=checkpoint.get("score_minmax"),
+                  hi_raw_kind="score" if checkpoint.get("score_mode") == "scalar_i" else "sigmoid_hi",
+                  final_hi="hi_score_scaled" if checkpoint.get("score_mode") == "scalar_i" else "hi_scaled")
     for split in ("dev", "test"):
         subset = table.loc[table.split == split]
         scales = {}
-        for name, column in (("raw", "hi_raw"), ("scaled", "hi_scaled")):
+        for name, column in (("raw", "hi_raw"), ("scaled", "hi_scaled"), ("score_scaled", "hi_score_scaled")):
+            if column not in subset:
+                continue  # Historical CSVs retain their original two scales.
+            if checkpoint.get("score_mode") == "scalar_i" and name == "raw":
+                scales[name] = {"available": False, "reason": "Raw scalar I is degradation score r; final HI uses score_scaled"}
+                continue
             if subset[column].isna().all():
-                scales[name] = {"available": False, "reason": "Training HI range is zero"}
+                scales[name] = {"available": False, "reason": "Scalar I bypasses Sigmoid; use score_scaled" if checkpoint.get("score_mode") == "scalar_i" and name == "scaled" else "Dev prediction range is zero"}
             else:
                 if subset[column].isna().any():
                     raise ValueError("Partially missing HI scale")
@@ -137,7 +156,10 @@ def plot_curves(table, report, output_path):
         return "N/A" if value is None else f"{value:.3f}"
 
     groups = list(table.groupby(["split", "unit"], sort=True))
-    figure, axes = plt.subplots(len(groups), 2, figsize=(14, 2.5 * len(groups)), layout="constrained", squeeze=False)
+    curve_scales = [("raw", "hi_raw"), ("scaled", "hi_scaled")]
+    if "hi_score_scaled" in table and "score_scaled" in report["splits"]["dev"]:
+        curve_scales.append(("score_scaled", "hi_score_scaled"))
+    figure, axes = plt.subplots(len(groups), len(curve_scales), figsize=(7 * len(curve_scales), 2.5 * len(groups)), layout="constrained", squeeze=False)
     if "diagnostic_type" in report:
         figure.suptitle(f"DS03 HI — {report['diagnostic_type']} | {report['mode']} | {report['joint_epoch']} joint epochs")
     else:
@@ -145,7 +167,7 @@ def plot_curves(table, report, output_path):
     try:
         for row, ((split, unit), group) in enumerate(groups):
             group = group.sort_values("cycle")
-            for column, (scale, field) in enumerate((("raw", "hi_raw"), ("scaled", "hi_scaled"))):
+            for column, (scale, field) in enumerate(curve_scales):
                 axis = axes[row, column]
                 axis.plot(group.cycle, group.hi_gt, color="black", linewidth=1, label="Reference HI")
                 entry = report["splits"][split][scale]
@@ -156,7 +178,7 @@ def plot_curves(table, report, output_path):
                     metrics = entry["per_unit"][str(int(unit))]
                     details = f"MAE={label(metrics['mae']['value'])} MAPE%={label(metrics['mape']['value'])} M={label(metrics['monotonicity']['value'])} rho={label(metrics['spearman']['value'])} MI={label(metrics['mi']['value'])}"
                 else:
-                    details = "Scaled unavailable: zero training HI range"
+                    details = entry["reason"]
                 axis.set_title(f"{split} unit {int(unit)} | {scale}\n{details}", fontsize=9)
                 axis.set_xlabel("Flight cycle")
                 axis.set_ylabel("HI")
@@ -176,6 +198,9 @@ def evaluate(config, checkpoint_path, output_dir=None):
         if any((run_dir / name).exists() for name in ("predictions.csv", "metrics.json", "hi_curves.png")):
             raise ValueError("Refusing to overwrite diagnostic evaluation artifacts; supply a new output directory")
     csv_path = run_dir / "predictions.csv"
+    # Separate evaluation metadata preserves old checkpoint and artifacts.
+    (run_dir / "score_scaling.json").write_text(json.dumps({"score_mode": checkpoint["score_mode"],
+        "score_minmax": checkpoint["score_minmax"], "source_checkpoint": str(checkpoint_path)}, indent=2) + "\n")
     table.to_csv(csv_path, index=False, float_format="%.17g")
     # Render from the exported table to preserve exact CSV/curve agreement.
     exported = pd.read_csv(csv_path, float_precision="round_trip")
