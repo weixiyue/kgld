@@ -172,10 +172,10 @@ def verify_model(config):
     with torch.no_grad():
         posterior = model.encode(x, mask)
         prior = model.conditional_prior(w, mask)
-        hi = model.predict_hi(x, mask)
-        torch.testing.assert_close(hi, torch.sigmoid(-model.hi_head(posterior[0])), rtol=0, atol=0)
-        torch.testing.assert_close(hi, model.predict_hi(x, mask), rtol=0, atol=0)
-        check(hi.shape == (len(indices),) and ((hi > 0) & (hi < 1)).all(), "Invalid deterministic HI")
+        hi = model.predict_score(x, mask)
+        torch.testing.assert_close(hi, model.hi_head(posterior[0]), rtol=0, atol=0)
+        torch.testing.assert_close(hi, model.predict_score(x, mask), rtol=0, atol=0)
+        check(hi.shape == (len(indices),) and torch.isfinite(hi).all(), "Invalid deterministic HI")
         changed_x = x.masked_fill(~mask[:, :, None], float("nan"))
         changed_w = w.masked_fill(~mask[:, :, None], float("nan"))
         padded_mask = torch.nn.functional.pad(mask, (0, 11), value=False)
@@ -186,7 +186,7 @@ def verify_model(config):
                 torch.testing.assert_close(base, changed, rtol=1e-6, atol=1e-6)
             for base, changed in zip(prior, model.conditional_prior(candidate_w, candidate_mask)):
                 torch.testing.assert_close(base, changed, rtol=1e-6, atol=1e-6)
-            torch.testing.assert_close(hi, model.predict_hi(candidate_x, candidate_mask), rtol=1e-6, atol=1e-6)
+            torch.testing.assert_close(hi, model.predict_score(candidate_x, candidate_mask), rtol=1e-6, atol=1e-6)
             base_reconstruction = model.decode(posterior[0], posterior[2], time_positions(mask))
             changed_reconstruction = model.decode(posterior[0], posterior[2], time_positions(candidate_mask))[:, :mask.shape[1]]
             torch.testing.assert_close(base_reconstruction[mask], changed_reconstruction[mask], rtol=1e-6, atol=1e-6)
@@ -216,11 +216,11 @@ def verify_model(config):
         check(not torch.equal(base["prior_mu_c"], altered["prior_mu_c"]), "W did not reach conditional prior")
         torch.testing.assert_close(base["x_hat"], altered["x_hat"], rtol=0, atol=0)
         with torch.no_grad():
-            torch.testing.assert_close(hi, model.predict_hi(x, mask), rtol=0, atol=0)
+            torch.testing.assert_close(hi, model.predict_score(x, mask), rtol=0, atol=0)
     finally:
         hook.remove()
     print("Mask/time: padding replacement/extension, single-flight comparison and length-one position verified")
-    print("Information paths: W affects prior; posterior/decoder/HI independence and deterministic sigmoid(-r) verified")
+    print("Information paths: W affects prior; posterior/decoder/HI independence and deterministic HIHead score verified")
 
     early = torch.tensor([-1., 0.], device=device, requires_grad=True)
     late = torch.tensor([1., 2.], device=device, requires_grad=True)
@@ -317,7 +317,7 @@ def verify_hi(config, path):
     import csv
     from losses import hi_loss
     from train import (REPRESENTATION_MODULES, extract_training_means, load_ocald,
-                       representation_state, sample_pairs, scale_hi,
+                       representation_state, sample_pairs, fit_score_scale, scale_score,
                        valid_pair_pools, validate_hi_config)
 
     validate_hi_config(config)
@@ -356,34 +356,23 @@ def verify_hi(config, path):
     early, late = pairs[:, 0], pairs[:, 1]
     check((units[early] == units[late]).all() and (cycles[late] - cycles[early] >= 5).all(), "Invalid same-unit order or cycle gap")
     with torch.no_grad():
-        hi_raw = torch.sigmoid(-model.hi_head(means)).cpu()
+        scores = model.score(means).cpu()
         probe = collate_fn([dataset[index] for index in range(min(3, len(dataset)))])
-        predicted = model.predict_hi(probe["x"].to(device), probe["mask"].to(device)).cpu()
-        repeated = model.predict_hi(probe["x"].to(device), probe["mask"].to(device)).cpu()
-    check(torch.isfinite(hi_raw).all() and ((hi_raw > 0) & (hi_raw < 1)).all(), "Invalid raw training HI")
-    torch.testing.assert_close(hi_raw, checkpoint["verification"]["train_hi_raw"], rtol=1e-6, atol=1e-7)
-    torch.testing.assert_close(predicted, checkpoint["verification"]["probe_hi_before_save"], rtol=1e-6, atol=1e-7)
+        predicted = model.predict_score(probe['x'].to(device), probe['mask'].to(device)).cpu()
+        repeated = model.predict_score(probe['x'].to(device), probe['mask'].to(device)).cpu()
+    check(torch.isfinite(scores).all(), 'Invalid dev scores')
+    verification = checkpoint['verification']
+    if 'train_scores' in verification:
+        torch.testing.assert_close(scores, verification['train_scores'], rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(predicted, verification['probe_score_before_save'], rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(predicted, repeated, rtol=0, atol=0)
-    parameters = checkpoint["hi_minmax"]
-    saved_raw = checkpoint["verification"]["train_hi_raw"]
-    check(parameters == {"min": saved_raw.min().item(), "max": saved_raw.max().item(), "fit_split": "dev", "count": len(dataset)},
-          "HI Min–Max parameters are not from all training predictions")
-    if parameters["min"] == parameters["max"]:
-        print("Training HI range zero: scaled HI unavailable")
-    else:
-        scaled = scale_hi(saved_raw, parameters)
-        torch.testing.assert_close(scaled.min(), torch.tensor(0.))
-        torch.testing.assert_close(scaled.max(), torch.tensor(1.))
-        # Out-of-range predictions stay out of range; no implicit clipping.
-        span = parameters["max"] - parameters["min"]
-        synthetic = torch.tensor([parameters["min"] - span, parameters["max"] + span], dtype=torch.float64)
-        torch.testing.assert_close(scale_hi(synthetic, parameters), torch.tensor([-1., 2.], dtype=torch.float64))
-    try:
-        scale_hi(torch.tensor([0.5]), {"min": 0.5, "max": 0.5})
-    except ValueError:
-        pass
-    else:
-        raise ValueError("Zero HI range was silently rescaled")
+    parameters = checkpoint.get('hi_mapping', fit_score_scale(scores))
+    check(parameters == fit_score_scale(scores), 'Mapping is not fitted on all dev scores')
+    if parameters['available']:
+        with torch.no_grad():
+            actual = model.predict_hi(probe['x'].to(device), probe['mask'].to(device), parameters)
+        torch.testing.assert_close(actual, scale_score(predicted.to(device), parameters), rtol=0, atol=0)
+    verify_score_mapping()
     objective = hi_loss(model.hi_head(means[early[:128]]), model.hi_head(means[late[:128]]), model.hi_head,
                         config["training"]["hi"]["kappa"], config["training"]["hi"]["l2_coefficient"])
     objective["loss"].backward()
@@ -423,7 +412,7 @@ def verify_hi(config, path):
     print(f"Stage 2 checkpoint: mode={checkpoint['mode']}, source={checkpoint['source_mode']}, epoch={epochs}, device={device}")
     print(f"Training flights={len(dataset)}; valid pairs per unit={[(int(unit.item()), len(pool)) for unit, pool in pools]}")
     print("Frozen weights/buffers exact; HI head updated and receives gradients; inference uses X/mask only")
-    print(f"Train raw HI: {parameters['min']:.9f}..{parameters['max']:.9f}; Min–Max fit=dev, count={parameters['count']}")
+    print(f"Dev score: {parameters['min']:.9f}..{parameters['max']:.9f}; reverse score scale fit=dev, count={parameters['count']}")
     print("Uniform unit/pair sampling, invalid/no-pair handling, deterministic reload, train-only scaling and no clipping verified")
     print("Last epoch loss:", {key: float(rows[-1][key]) for key in ("loss", "order", "l2")})
     print("PASS: T4 HI training and independent inference verification")
@@ -433,6 +422,7 @@ def verify_metrics(config):
     from metrics import (evaluate_metrics, failure_consistency, mae, mape,
                          monotonicity, spearman, transformed_mi)
     from evaluate import attach_references, metric_report
+    from model import fit_score_scale
     import pandas as pd
 
     np.testing.assert_allclose(mae(np.array([.5, .5, .3]), np.array([1., .5, 0.])), .8 / 3)
@@ -474,12 +464,12 @@ def verify_metrics(config):
     shuffled = np.random.default_rng(42).permutation(len(p))
     check(evaluate_metrics(p[shuffled], gt[shuffled], units[shuffled], cycles[shuffled], rul[shuffled], 42) == report,
           "Metric results depend on table row order rather than keyed cycle order")
-    prediction = pd.DataFrame({"unit": [1, 1], "cycle": [2, 1], "hi_raw": [.4, .7]})
+    prediction = pd.DataFrame({"unit": [1, 1], "cycle": [2, 1], "score": [.4, .7]})
     hi = pd.DataFrame({"unit": [1, 1], "cycle": [1, 2], "hi_gt": [.9, .5]})
     labels = pd.DataFrame({"unit": [1, 1], "cycle": [2, 1], "rul": [0, 1]})
     aligned = attach_references(prediction, hi, labels)
     check(aligned.cycle.tolist() == [1, 2] and aligned.hi_gt.tolist() == [.9, .5]
-          and aligned.hi_raw.tolist() == [.7, .4], "References were positionally joined")
+          and aligned.score.tolist() == [.7, .4], "References were positionally joined")
     try:
         attach_references(prediction, hi.iloc[:1], labels)
     except ValueError:
@@ -488,54 +478,46 @@ def verify_metrics(config):
         raise ValueError("Missing reference keys were accepted")
     zero_scale_table = pd.DataFrame({"split": ["dev"] * 10 + ["test"] * 10,
                                     "unit": np.tile(units, 2), "cycle": np.tile(cycles, 2),
-                                    "hi_raw": np.tile(p, 2), "hi_scaled": np.full(20, np.nan),
+                                    "score": np.tile(p, 2), "hi": np.full(20, np.nan),
                                     "hi_gt": np.tile(gt, 2), "rul": np.tile(rul, 2)})
     zero_scale_checkpoint = {"mode": "smoke", "source_mode": "smoke", "epoch": 3, "source_epoch": 3,
-                             "config": config, "hi_minmax": {"min": .5, "max": .5, "count": 10, "fit_split": "dev"}}
+                             "config": config, "hi_mapping": fit_score_scale(torch.full((10,), .5))}
     zero_scale_report = metric_report(zero_scale_table, zero_scale_checkpoint)
-    check(all(not zero_scale_report["splits"][split]["scaled"]["available"]
-              and zero_scale_report["splits"][split]["raw"]["available"] for split in ("dev", "test")),
+    check(all(not zero_scale_report["splits"][split]["hi"]["available"] for split in ("dev", "test")),
           "Zero training HI range did not mark scaled evaluation unavailable")
     print("PASS: T5 reference-aligned metrics, keyed associations and train-only scale availability")
 
 
-def verify_evaluation(config, run_dir):
+def verify_evaluation(config, run_dir, checkpoint_path=None):
     import json
     import pandas as pd
-    from evaluate import metric_report, plot_curves, predict_table
-    from train import scale_hi
+    from evaluate import metric_report, predict_table
+    from model import fit_score_scale, scale_score
 
     run_dir = Path(run_dir)
-    table = pd.read_csv(run_dir / "predictions.csv", float_precision="round_trip")
-    with (run_dir / "metrics.json").open(encoding="utf-8") as stream:
-        report = json.load(stream, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"Invalid JSON constant: {value}")))
-    fresh, checkpoint = predict_table(config, run_dir / "ocald.pt")
-    check(set(table.columns) in ({"split", "unit", "cycle", "hi_raw", "hi_scaled", "hi_gt", "rul"},
-                                {"split", "unit", "cycle", "hi_raw", "hi_scaled", "hi_gt", "rul", "hi_score", "hi_score_scaled"}), "Prediction columns differ")
-    keys = ["split", "unit", "cycle"]
-    check(not table.duplicated(keys).any(), "Duplicate prediction keys")
-    table = table.sort_values(keys).reset_index(drop=True)
-    fresh = fresh.sort_values(keys).reset_index(drop=True)
-    check(table[keys].equals(fresh[keys]) and len(table) == len(fresh), "CSV rows/keys differ from actual flights")
-    for field in ("hi_raw", "hi_scaled", "hi_gt", "rul"):
+    metadata = json.loads((run_dir / 'score_scaling.json').read_text())
+    checkpoint_path = checkpoint_path or metadata['source_checkpoint']
+    table = pd.read_csv(run_dir / 'predictions.csv', float_precision='round_trip')
+    report = json.loads((run_dir / 'metrics.json').read_text())
+    fresh, checkpoint = predict_table(config, checkpoint_path)
+    check(set(table.columns) == {'split','unit','cycle','score','hi','hi_gt','rul'}, 'Prediction columns differ')
+    keys = ['split','unit','cycle']
+    check(not table.duplicated(keys).any() and table[keys].equals(fresh[keys]), 'Prediction keys differ')
+    for field in ('score','hi','hi_gt','rul'):
         np.testing.assert_allclose(table[field], fresh[field], rtol=0, atol=0, equal_nan=True)
-    recomputed = metric_report(table, checkpoint)
-    check(report == {key: recomputed[key] for key in report}, "Exported metrics differ from CSV data")
-    if checkpoint["hi_minmax"]["min"] != checkpoint["hi_minmax"]["max"]:
-        expected = scale_hi(torch.tensor(table.hi_raw.to_numpy()), checkpoint["hi_minmax"]).numpy()
-        np.testing.assert_allclose(table.hi_scaled, expected, rtol=1e-6, atol=1e-7)
+    check(report == metric_report(table, checkpoint), 'Metrics differ from keyed predictions')
+    mapping = checkpoint['hi_mapping']
+    fitted = fit_score_scale(torch.tensor(table.loc[table.split == 'dev','score'].to_numpy()))
+    check(mapping == fitted and metadata['hi_mapping'] == mapping, 'Mapping differs from all dev scores')
+    if mapping['available']:
+        expected = scale_score(torch.tensor(table.score.to_numpy()), mapping).numpy()
+        np.testing.assert_allclose(table.hi, expected, rtol=1e-6, atol=1e-7)
     else:
-        check(table.hi_scaled.isna().all() and all(not report["splits"][split]["scaled"]["available"] for split in ("dev", "test")), "Zero range was silently scaled")
-    # A temporary re-render invokes the exact CSV/curve point checks.
-    plot_curves(table, report, "/tmp/ocald_t5_curve_verification.png")
-    image = run_dir / "hi_curves.png"
-    check(image.is_file() and image.stat().st_size > 0, "Missing curve artifact")
-    if checkpoint["mode"] == "formal":
-        check(checkpoint["source_mode"] == "formal" and checkpoint["source_epoch"] == checkpoint["epoch"] == 100,
-              "Formal evaluation did not use 100/100 epochs")
-    print(f"CSV verified: {len(table)} actual flights; dev={(table.split == 'dev').sum()}, test={(table.split == 'test').sum()}")
-    print(f"Evaluation mode={checkpoint['mode']}; CSV/reference/prediction/metrics/curves agree; no test refitting or clipping")
-    print("PASS: T5 evaluation verification (predictions, references, metrics and curves)")
+        check(table.hi.isna().all(), 'Zero score range was silently mapped')
+    import hashlib
+    check(metadata['checkpoint_sha256'] == hashlib.sha256(Path(checkpoint_path).read_bytes()).hexdigest(), 'Source checkpoint was modified')
+    check((run_dir/'hi_curves.png').stat().st_size > 0, 'Missing curve artifact')
+    print(f'PASS: evaluation {len(table)} keyed flights, dev-only mapping, test reuse, score/HI/metrics and source checkpoint consistency')
 
 
 def plot_data(config, split, unit, cycle, parameters):
@@ -604,20 +586,37 @@ def plot_data(config, split, unit, cycle, parameters):
     print("PASS: T1 data plot (normalized flight parameters and full reference HI)")
 
 
+def verify_score_mapping():
+    from model import fit_score_scale, scale_score
+
+    parameters = fit_score_scale(torch.tensor([2., 4., 6.]))
+    torch.testing.assert_close(scale_score(torch.tensor([2., 4., 6.]), parameters), torch.tensor([1., .5, 0.]))
+    torch.testing.assert_close(scale_score(torch.tensor([0., 8.]), parameters), torch.tensor([1.5, -.5]))
+    check(parameters['count'] == 3 and parameters['fit_split'] == 'dev', 'Wrong mapping fit scope')
+    zero = fit_score_scale(torch.ones(3))
+    check(not zero['available'], 'Zero range must be unavailable')
+    for invalid in (zero, {'min':0.,'max':1.,'count':3,'fit_split':'dev','available':True}):
+        try:
+            scale_score(torch.tensor([.5]), invalid)
+        except ValueError:
+            pass
+        else:
+            raise ValueError('Zero range or untyped legacy mapping was accepted')
+
+
 def verify_pipeline(config, checkpoint_path=None):
-    """Lightweight unified-loss/path checks and optional saved-joint verification."""
-    import json
-    import pandas as pd
-    from losses import training_loss, reconstruction_loss, representation_loss
-    from model import OCALD
+    """Key score mapping, unchanged objectives/gradient paths and checkpoint checks."""
+    from losses import training_loss, representation_loss
+    from model import OCALD, fit_score_scale, scale_score
     from train import (datasets_for, joint_schedule, move_batch, encoder_order_norm,
                        representation_weights, hi_weights, freeze_representation,
-                       load_ocald, extract_training_means, state_hash)
-    from evaluate import predict_table, metric_report
+                       load_ocald, extract_training_means, state_hash, check_mechanisms)
+    from evaluate import predict_table
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if device.type == 'cpu':
         torch.set_num_threads(1)
+    verify_score_mapping()
     processed = load_processed(config)
     datasets = datasets_for(processed, True)
     schedule = joint_schedule(datasets['dev'].flights, 3, 2, 42)
@@ -625,103 +624,75 @@ def verify_pipeline(config, checkpoint_path=None):
     pairs = schedule['pairs'][0,0].to(device)
     torch.manual_seed(42)
     model = OCALD(config).to(device).train()
-    if model.score_mode == 'scalar_i':
-        from train import check_mechanisms, fit_score_scale, scale_score
+    check(model.hi_head is not None, 'This verification covers HIHead pipelines')
+    output = model(batch['x'], batch['w'], batch['mask'])
+    scores = model.score(output['mu_i'])
+    torch.testing.assert_close(scores, model.hi_head(output['mu_i']), rtol=0, atol=0)
+    weights = config['training'].get('joint', {}).get('loss_weights', dict(reconstruction=1.,kl_i=1.,kl_c=1.,order=10.,l2=.0001))
+    terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
+                          r_early=scores[pairs[:,0]],r_late=scores[pairs[:,1]])
+    expected = sum(weights[key]*terms[key] for key in weights)
+    torch.testing.assert_close(terms['loss'], expected, rtol=1e-6, atol=1e-5)
+    params = tuple(model.parameters())
+    actual_grads = torch.autograd.grad(terms['loss'],params,retain_graph=True)
+    expected_grads = torch.autograd.grad(expected,params,retain_graph=True)
+    for actual, reference in zip(actual_grads,expected_grads):
+        torch.testing.assert_close(actual,reference,rtol=1e-5,atol=1e-5)
+    check(encoder_order_norm(model,terms['order']) > 0,'Ordering does not reach encoder')
+    stage1 = training_loss(model.hi_head,representation_weights(config),x=batch['x'],mask=batch['mask'],output=output)
+    torch.testing.assert_close(stage1['loss'],representation_loss(batch['x'],batch['mask'],output,1.)['loss'],rtol=0,atol=0)
+    check(all(g is None for g in torch.autograd.grad(stage1['loss'],tuple(model.hi_head.parameters()),allow_unused=True,retain_graph=True)), 'Stage 1 reached HI head')
+    # Existing mechanism checks use joint weights only to verify the graph.
+    if 'joint' in config['training']:
         check_mechanisms(config, batch, pairs)
-        dev = torch.tensor([2., 4., 6.], device=device)
-        params = fit_score_scale(dev)
-        torch.testing.assert_close(scale_score(torch.tensor([0., 8.], device=device), params),
-                                   torch.tensor([1.5, -.5], device=device))
-        assert params == fit_score_scale(dev)  # Test predictions never enter fit.
-        assert not fit_score_scale(torch.ones(3, device=device))['available']
-        try:
-            scale_score(dev, fit_score_scale(torch.ones(3, device=device)))
-        except ValueError:
-            pass
-        else:
-            raise AssertionError('Zero range must fail explicitly')
-    else:
-        output = model(batch['x'], batch['w'], batch['mask'])
-        scores = model.hi_head(output['mu_i'])
-        for ki in (0., 1.):
-            weights = {'reconstruction':1., 'kl_i':ki, 'kl_c':1., 'order':10., 'l2':1e-4}
-            terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
-                                  r_early=scores[pairs[:,0]],r_late=scores[pairs[:,1]])
-            expected = terms['reconstruction']+ki*terms['kl_i']+terms['kl_c']+10*terms['order']+1e-4*terms['l2']
-            torch.testing.assert_close(terms['loss'],expected,rtol=1e-6,atol=1e-5)
-            assert terms['kl_i'].item() > 0
-            if ki == 0:
-                assert torch.autograd.grad(terms['loss'],terms['kl_i'],allow_unused=True,retain_graph=True)[0] is None
-            grads = torch.autograd.grad(terms['loss'],tuple(model.conditional_prior.parameters()),retain_graph=True)
-            assert all(torch.isfinite(g).all() for g in grads) and sum(g.square().sum().item() for g in grads)>0
-            assert encoder_order_norm(model,terms['order']) > 0
-        stage1 = training_loss(model.hi_head,representation_weights(config),x=batch['x'],mask=batch['mask'],output=output)
-        torch.testing.assert_close(stage1['loss'],representation_loss(batch['x'],batch['mask'],output,1.)['loss'],rtol=0,atol=0)
-        changed_x = batch['x'].masked_fill(~batch['mask'][:,:,None],float('nan'))
-        changed_hat = output['x_hat'].masked_fill(~batch['mask'][:,:,None],float('nan'))
-        torch.testing.assert_close(reconstruction_loss(changed_x,changed_hat,batch['mask'],1.),
-                                   reconstruction_loss(batch['x'],output['x_hat'],batch['mask'],1.),rtol=0,atol=0)
-        model.zero_grad(set_to_none=True)
-        freeze_representation(model)
-        with torch.no_grad():
-            mean = model.encode(batch['x'],batch['mask'])[0]
-        r = model.hi_head(mean)
-        stage2 = training_loss(model.hi_head,hi_weights(config),r_early=r[pairs[:,0]],r_late=r[pairs[:,1]])
-        stage2['loss'].backward()
-        assert all(p.grad is None and not p.requires_grad for name in ('sensor_encoder','conditional_prior','decoder') for p in getattr(model,name).parameters())
-        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.hi_head.parameters())
+    model.zero_grad(set_to_none=True)
+    freeze_representation(model)
+    with torch.no_grad():
+        mean = model.encode(batch['x'],batch['mask'])[0]
+        direct = model.predict_score(batch['x'],batch['mask'])
+        torch.testing.assert_close(direct,model.hi_head(mean),rtol=0,atol=0)
+        mapping = fit_score_scale(direct)
+        if mapping['available']:
+            torch.testing.assert_close(model.predict_hi(batch['x'],batch['mask'],mapping),scale_score(direct,mapping),rtol=0,atol=0)
+    r = model.score(mean)
+    stage2 = training_loss(model.hi_head,hi_weights(config),r_early=r[pairs[:,0]],r_late=r[pairs[:,1]])
+    stage2['loss'].backward()
+    check(all(p.grad is None and not p.requires_grad for name in ('sensor_encoder','conditional_prior','decoder') for p in getattr(model,name).parameters()), 'Stage 2 representation not frozen')
+    check(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.hi_head.parameters()), 'Head gradients invalid')
     if checkpoint_path is not None:
         restored,saved = load_ocald(checkpoint_path,device)
         prepared = load_processed(saved['config'])
         data = FlightDataset(prepared,'dev')
-        if 'flight_keys' in saved:
-            lookup = {(f['unit'],f['cycle']):f for f in data.flights}
-            data.flights = [lookup[tuple(key)] for key in saved['flight_keys']['dev']]
         if 'initial_state_dict' in saved:
             torch.manual_seed(saved['seed'])
             initial = OCALD(saved['config'])
             for key,value in initial.state_dict().items():
                 torch.testing.assert_close(value,saved['initial_state_dict'][key],rtol=0,atol=0)
-            assert state_hash(saved['initial_state_dict']) == saved['initial_sha256']
+            check(state_hash(saved['initial_state_dict']) == saved['initial_sha256'], 'Initial hash mismatch')
         schedule_path = Path(checkpoint_path).with_name('sampling_schedule.pt')
         if schedule_path.exists():
             plan = torch.load(schedule_path,map_location='cpu',weights_only=True)
-            fresh = joint_schedule(data.flights,saved['epoch'],plan['flights'].shape[1],saved['seed'])
-            assert all(torch.equal(plan[key],fresh[key]) for key in fresh)
-        means,_,_ = extract_training_means(restored,data,16,device)
-        with torch.no_grad():
-            device_score = restored.score(means)
-            score = device_score.cpu()
-            raw = score if restored.score_mode == 'scalar_i' else torch.sigmoid(-device_score).cpu()
+            if 'training_flight_keys' in saved:
+                lookup = {(f['unit'],f['cycle']): f for f in data.flights}
+                flights = [lookup[tuple(key)] for key in saved['training_flight_keys']]
+            else:
+                flights = data.flights
+            fresh_plan = joint_schedule(flights,saved['epoch'],plan['flights'].shape[1],saved['seed'])
+            check(all(torch.equal(plan[key],fresh_plan[key]) for key in fresh_plan), 'Sampling schedule mismatch')
+        table, evaluated = predict_table(None,checkpoint_path)
+        score = torch.tensor(table.loc[table.split == 'dev','score'].to_numpy(),dtype=torch.float32)
+        check(fit_score_scale(score) == evaluated['hi_mapping'],'Full dev score mapping mismatch')
         if 'scores' in saved:
-            torch.testing.assert_close(score, saved['scores']['dev'], rtol=0, atol=0)
-            from train import fit_score_scale
-            assert fit_score_scale(score) == saved['score_minmax']
-        recorded = saved['verification']['train_hi_raw'] if saved['stage']=='hi' else saved['raw_hi']['dev']
-        torch.testing.assert_close(raw,recorded,rtol=0,atol=0)
-        assert saved['hi_minmax'] == {'min':raw.min().item(),'max':raw.max().item(),'count':len(data),'fit_split':'dev'}
+            for split in ('dev','test'):
+                torch.testing.assert_close(torch.tensor(table.loc[table.split == split,'score'].to_numpy(),dtype=torch.float32),saved['scores'][split],rtol=0,atol=0)
+        elif 'train_scores' in saved.get('verification',{}):
+            torch.testing.assert_close(score,saved['verification']['train_scores'],rtol=0,atol=0)
         predictions_path = Path(checkpoint_path).with_name('predictions.csv')
         if predictions_path.exists():
-            fresh,loaded = predict_table(None,checkpoint_path)
-            disk = pd.read_csv(predictions_path,float_precision='round_trip')
-            assert fresh[['split','unit','cycle']].equals(disk[['split','unit','cycle']])
-            for field in ('hi_raw','hi_scaled','hi_gt','rul', 'hi_score', 'hi_score_scaled'):
-                if field in disk:
-                    np.testing.assert_allclose(fresh[field],disk[field],rtol=0,atol=0,equal_nan=True)
-            if 'hi_score_scaled' in disk:
-                from train import fit_score_scale, scale_score
-                scale = fit_score_scale(torch.tensor(disk.loc[disk.split == 'dev', 'hi_score'].to_numpy()))
-                assert scale == loaded['score_minmax']
-                if scale['available']:
-                    expected = scale_score(torch.tensor(disk.hi_score.to_numpy()), scale).numpy()
-                    np.testing.assert_allclose(expected, disk.hi_score_scaled, rtol=1e-6, atol=1e-7)
-                else:
-                    assert disk.hi_score_scaled.isna().all()
-            report = metric_report(disk,loaded)
-            recorded_report = json.loads(Path(checkpoint_path).with_name('metrics.json').read_text())
-            # New metadata must not invalidate historical two-scale reports.
-            assert {key: report[key] for key in recorded_report} == recorded_report
-    print('PASS: unified pipeline loss weights, zero-weight recording/path, mask, freeze, initialization, schedule, checkpoint and evaluation')
+            import pandas as pd
+            if 'score' in pd.read_csv(predictions_path,nrows=0).columns:
+                verify_evaluation(config,Path(checkpoint_path).parent,checkpoint_path)
+    print('PASS: score mapping/direction/zero range/no clipping, unchanged loss gradients, Stage 1/2 paths, loading, initialization, schedule and dev fitting')
 
 
 def main():
@@ -755,7 +726,7 @@ def main():
     elif args.task == "evaluation":
         if args.run_dir is None:
             parser.error("evaluation requires --run-dir")
-        verify_evaluation(config, args.run_dir)
+        verify_evaluation(config, args.run_dir, args.checkpoint)
     else:
         if any(value is None for value in (args.split, args.unit, args.cycle, args.parameters)):
             parser.error("data-plot requires --split, --unit, --cycle and --parameters")

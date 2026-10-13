@@ -17,7 +17,7 @@ import yaml
 
 from data import FlightDataset, collate_fn, load_config, load_processed
 from losses import head_l2, order_loss, reconstruction_loss, representation_loss, training_loss
-from model import OCALD, time_positions
+from model import OCALD, time_positions, fit_score_scale, scale_score, validate_score_scale
 from torch.nn import functional as F
 
 
@@ -148,7 +148,7 @@ def train_representation(config, smoke):
                   "device": str(device), "hi_head_unchanged": True,
                   "verification": {"indices": probe_indices, "posterior_before_save": posterior}}
     checkpoint.update({"structure": config["model"], "training_mode": "representation",
-                       "loss_weights": representation_weights(config), "hi_minmax": None})
+                       "loss_weights": representation_weights(config)})
     path = run_dir / "representation.pt"
     torch.save(checkpoint, path)
     loaded, _ = load_representation(path, device)
@@ -243,30 +243,13 @@ def load_ocald(path, device):
         validate_hi_config(checkpoint['config'])
     else:
         raise ValueError('Expected an HI or joint checkpoint')
+    if "hi_mapping" in checkpoint:
+        validate_score_scale(checkpoint["hi_mapping"])
     model = OCALD(checkpoint['config'])
     model.load_state_dict(checkpoint['state_dict'], strict=True)
     model.to(device).eval()
     freeze_representation(model)
     return model, checkpoint
-
-
-def fit_score_scale(scores):
-    if scores.ndim != 1 or not len(scores) or not torch.isfinite(scores).all():
-        raise ValueError('Score scale needs finite dev predictions')
-    return {'min': scores.min().item(), 'max': scores.max().item(),
-            'count': len(scores), 'fit_split': 'dev', 'available': scores.max().item() != scores.min().item()}
-
-
-def scale_score(scores, parameters):
-    if parameters['fit_split'] != 'dev' or parameters['max'] == parameters['min']:
-        raise ValueError('Dev score range is zero or invalid; score-scaled HI unavailable')
-    return (parameters['max'] - scores) / (parameters['max'] - parameters['min'])
-
-
-def scale_hi(hi_raw, parameters):
-    if parameters["max"] == parameters["min"]:
-        raise ValueError("Training HI range is zero; scaled HI is unavailable")
-    return (hi_raw - parameters["min"]) / (parameters["max"] - parameters["min"])
 
 
 def train_hi(config, representation_path, smoke):
@@ -344,32 +327,34 @@ def train_hi(config, representation_path, smoke):
         raise RuntimeError("HI head did not update")
     model.eval()
     with torch.no_grad():
-        train_hi_raw = torch.sigmoid(-model.hi_head(means)).cpu()
-    if not torch.isfinite(train_hi_raw).all() or not ((train_hi_raw > 0) & (train_hi_raw < 1)).all():
-        raise RuntimeError("Training HI values are nonfinite or outside (0,1)")
-    minmax = {"min": train_hi_raw.min().item(), "max": train_hi_raw.max().item(), "fit_split": "dev", "count": len(dataset)}
-    if minmax["max"] == minmax["min"]:
-        print("Training HI range is zero; scaled HI is unavailable", flush=True)
+        train_scores = model.score(means).cpu()
+    mapping = fit_score_scale(train_scores)
+    if not mapping["available"]:
+        print("Dev score range is zero; HI is unavailable", flush=True)
     probe = collate_fn([dataset[index] for index in range(min(3, len(dataset)))])
     with torch.no_grad():
-        probe_hi = model.predict_hi(probe["x"].to(device), probe["mask"].to(device)).cpu()
+        probe_score = model.predict_score(probe["x"].to(device), probe["mask"].to(device)).cpu()
     state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     if not all(torch.isfinite(value).all().item() for value in state.values()):
         raise RuntimeError("Nonfinite HI checkpoint weights")
     checkpoint = {"stage": "hi", "mode": mode, "epoch": epochs, "config": config, "state_dict": state,
-                  "normalization": source["normalization"], "columns": source["columns"], "hi_minmax": minmax,
+                  "normalization": source["normalization"], "columns": source["columns"], "hi_mapping": mapping, "score_mode": model.score_mode,
                   "source_mode": source["mode"], "source_epoch": source["epoch"], "device": str(device),
                   "verification": {"representation_before": before, "initial_head": initial_head, "last_pairs": last_pairs,
-                                   "train_hi_raw": train_hi_raw, "units": units.cpu(), "cycles": cycles.cpu(),
-                                   "probe_hi_before_save": probe_hi}}
+                                   "train_scores": train_scores, "units": units.cpu(), "cycles": cycles.cpu(),
+                                   "probe_score_before_save": probe_score}}
     checkpoint.update({"structure": config["model"], "training_mode": "hi", "loss_weights": hi_weights(config)})
     path = run_dir / "ocald.pt"
     torch.save(checkpoint, path)
     restored, _ = load_ocald(path, device)
     with torch.no_grad():
-        reloaded_hi = restored.predict_hi(probe["x"].to(device), probe["mask"].to(device)).cpu()
-    torch.testing.assert_close(probe_hi, reloaded_hi, rtol=0, atol=0)
-    print(f"Training raw HI range={minmax['min']:.9f}..{minmax['max']:.9f}; saved last epoch: {path}", flush=True)
+        reloaded_score = restored.predict_score(probe["x"].to(device), probe["mask"].to(device)).cpu()
+    torch.testing.assert_close(probe_score, reloaded_score, rtol=0, atol=0)
+    if mapping["available"]:
+        with torch.no_grad():
+            predicted_hi = restored.predict_hi(probe["x"].to(device), probe["mask"].to(device), mapping).cpu()
+        torch.testing.assert_close(predicted_hi, scale_score(reloaded_score.to(device), mapping).cpu(), rtol=0, atol=0)
+    print(f"Dev score range={mapping['min']:.9f}..{mapping['max']:.9f}; saved last epoch: {path}", flush=True)
     print("Frozen state exact; head updated; independent HI reload exact", flush=True)
     return path
 
@@ -625,18 +610,15 @@ def train_joint(config, smoke):
     rng = torch.cuda.get_rng_state(device) if device.type == 'cuda' else torch.get_rng_state()
     digest = hashlib.sha256(rng.numpy().tobytes()).hexdigest()
     model.eval()
-    raw, scores = {}, {}
-    for split,dataset in datasets.items():
-        means,_,_ = extract_training_means(model,dataset,16,device)
+    scores = {}
+    # Smoke restricts training only; mapping always uses the entire dev split.
+    prediction_datasets = datasets_for(processed, False)
+    for split, dataset in prediction_datasets.items():
+        means, _, _ = extract_training_means(model, dataset, 16, device)
         with torch.no_grad():
-            device_scores = model.score(means)
-            scores[split] = device_scores.cpu()
-            raw[split] = scores[split] if model.score_mode == 'scalar_i' else torch.sigmoid(-device_scores).cpu()
-        if not torch.isfinite(raw[split]).all():
-            raise RuntimeError('Nonfinite final raw HI')
-    scale = {'min':raw['dev'].min().item(),'max':raw['dev'].max().item(),'count':len(raw['dev']),'fit_split':'dev'}
+            scores[split] = model.score(means).cpu()
     score_scale = fit_score_scale(scores['dev'])
-    saved = {'score_mode': model.score_mode, 'scores': scores, 'score_minmax': score_scale,
+    saved = {'score_mode': model.score_mode, 'scores': scores, 'hi_mapping': score_scale,
              'stage':'joint','training_mode':'joint','structure':{**config['model'], 'decoder_use_w':model.decoder_use_w, 'score_mode':model.score_mode},
              'mode':'smoke' if smoke else 'full','epoch':epochs,'seed':seed,'config':config,
              'loss_weights':weights,'actual_training':{**settings,'epochs':epochs,'seed':seed},
@@ -646,19 +628,20 @@ def train_joint(config, smoke):
              'initialization_rule':'pytorch_defaults_scalar_no_head_then_isolated_w_layer' if model.score_mode == 'scalar_i' else 'legacy_modules_then_isolated_decoder_input_layer' if model.decoder_use_w else 'legacy_default',
              'sampling_rule':'CPU seed42 flight generator; independent CPU seed42 uniform-unit/valid-pair RNG; saved schedule',
              'reparameterization_rule':'torch seed42 after mechanism checks; default initialization then per-forward randn_like for I and C; architecture-dependent RNG consumption',
-             'raw_hi_kind':'score' if model.score_mode == 'scalar_i' else 'sigmoid_hi',
-             'reparameterization_rng_digest':digest,'raw_hi':raw,'hi_minmax':scale,
-             'flight_keys':{s:[[f['unit'],f['cycle']] for f in d.flights] for s,d in datasets.items()}}
+             'reparameterization_rng_digest':digest,
+             'flight_keys':{s:[[f['unit'],f['cycle']] for f in d.flights] for s,d in prediction_datasets.items()},
+             'training_flight_keys': [[f['unit'],f['cycle']] for f in datasets['dev'].flights]}
     torch.save(saved,root/'checkpoint.pt')
     (root/'verification.json').write_text(json.dumps(checks,indent=2)+'\n')
     restored,_ = load_ocald(root/'checkpoint.pt',device)
-    for split,dataset in datasets.items():
+    for split,dataset in prediction_datasets.items():
         means,_,_ = extract_training_means(restored,dataset,16,device)
         with torch.no_grad():
             device_score = restored.score(means)
             score = device_score.cpu()
             torch.testing.assert_close(score, scores[split], rtol=0, atol=0)
-            torch.testing.assert_close(score if restored.score_mode == 'scalar_i' else torch.sigmoid(-device_score).cpu(), raw[split], rtol=0, atol=0)
+            if score_scale['available']:
+                torch.testing.assert_close(scale_score(score, score_scale), scale_score(scores[split], score_scale), rtol=0, atol=0)
     print(f'PASS: joint last checkpoint exact reload; checkpoint={root/"checkpoint.pt"}',flush=True)
     return root/'checkpoint.pt'
 
@@ -670,10 +653,13 @@ def main():
     parser.add_argument('--stage',choices=['representation','hi','joint'],help='Optional individual-stage entry (legacy compatible)')
     parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--representation')
+    parser.add_argument('--output-root', help='Isolated output location; saved in config snapshot')
     args = parser.parse_args()
     if args.pipeline and args.stage:
         parser.error('Choose --pipeline or --stage, not both')
     config = load_config(args.config)
+    if args.output_root is not None:
+        config['output']['root'] = args.output_root
     if not torch.cuda.is_available():
         torch.set_num_threads(1)
     flow = args.stage or args.pipeline or config['training'].get('pipeline','two_stage')

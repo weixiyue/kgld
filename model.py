@@ -5,6 +5,35 @@ from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence
 
 
+HI_MAPPING_TYPE = "dev_score_reverse_minmax"
+
+
+def fit_score_scale(dev_scores):
+    """Fit one global mapping from all final dev scores, without labels."""
+    if dev_scores.ndim != 1 or not len(dev_scores) or not torch.isfinite(dev_scores).all():
+        raise ValueError("HI mapping requires nonempty finite dev scores")
+    minimum, maximum = dev_scores.min().item(), dev_scores.max().item()
+    return {"type": HI_MAPPING_TYPE, "min": minimum, "max": maximum,
+            "fit_split": "dev", "count": len(dev_scores), "available": maximum != minimum}
+
+
+def validate_score_scale(parameters):
+    if (parameters.get("type") != HI_MAPPING_TYPE or parameters.get("fit_split") != "dev"
+            or not isinstance(parameters.get("count"), int) or parameters["count"] <= 0
+            or not all(torch.isfinite(torch.tensor(parameters[key], dtype=torch.float64)) for key in ("min", "max"))
+            or parameters["max"] < parameters["min"]
+            or parameters.get("available") != (parameters["max"] != parameters["min"])):
+        raise ValueError("Invalid dev score HI mapping; legacy HI Min-Max is not accepted")
+
+
+def scale_score(scores, parameters):
+    """The single HI mapping used by training, inference and evaluation."""
+    validate_score_scale(parameters)
+    if not parameters["available"]:
+        raise ValueError("Dev score range is zero; HI is unavailable")
+    return (parameters["max"] - scores) / (parameters["max"] - parameters["min"])
+
+
 def valid_lengths(mask):
     if mask.ndim != 2 or mask.dtype != torch.bool:
         raise ValueError("mask must be bool [B, T]")
@@ -137,10 +166,8 @@ class OCALD(nn.Module):
     def predict_score(self, x, mask):
         return self.score(self.encode(x, mask)[0])
 
-    def predict_hi(self, x, mask):
-        if self.score_mode == "scalar_i":
-            raise ValueError("Scalar I HI requires dev score_minmax; use predict_score and scale_score")
-        return torch.sigmoid(-self.predict_score(x, mask))
+    def predict_hi(self, x, mask, score_parameters):
+        return scale_score(self.predict_score(x, mask), score_parameters)
 
     def forward(self, x, w, mask):
         mu_i, logvar_i, mu_c, logvar_c = self.encode(x, mask)
