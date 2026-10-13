@@ -1,19 +1,24 @@
-"""Approved two-stage OCALD training and independent checkpoint loading."""
+"""OCALD two-stage and weighted joint pipelines with compatible checkpoints."""
 
 import argparse
 import csv
+import hashlib
+import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 import random
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Subset
 import yaml
 
 from data import FlightDataset, collate_fn, load_config, load_processed
-from losses import hi_loss, representation_loss
-from model import OCALD
+from losses import head_l2, order_loss, reconstruction_loss, representation_loss, training_loss
+from model import OCALD, time_positions
+from torch.nn import functional as F
 
 
 REPRESENTATION_MODULES = ("sensor_encoder", "conditional_prior", "decoder")
@@ -89,17 +94,23 @@ def train_representation(config, smoke):
     print(f"Stage=representation mode={mode} device={device} epochs={epochs} flights={len(indices)}/{len(dataset)} batch_size={settings['batch_size']}", flush=True)
     print(f"CPU threads={torch.get_num_threads()}; run_dir={run_dir}", flush=True)
     with (run_dir / "losses.csv").open("w", newline="", encoding="utf-8") as stream:
-        fields = ["stage", "mode", "epoch", "flights", "loss", "reconstruction", "kl_i", "kl_c"]
+        fields = ["stage", "mode", "epoch", "flights", "loss", "reconstruction", "kl_i", "kl_c", "order", "l2"]
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for epoch in range(1, epochs + 1):
             model.train()
-            totals = {key: 0.0 for key in ("loss", "reconstruction", "kl_i", "kl_c")}
+            totals = {key: 0.0 for key in ("loss", "reconstruction", "kl_i", "kl_c", "order", "l2")}
             count = 0
             for batch in loader:
                 x, w, mask = (batch[key].to(device) for key in ("x", "w", "mask"))
                 optimizer.zero_grad(set_to_none=True)
-                losses = representation_loss(x, mask, model(x, w, mask), settings["sigma_x_squared"])
+                output = model(x, w, mask)
+                pair = torch.nonzero((batch['unit'][:, None] == batch['unit'][None, :])
+                                     & (batch['cycle'][None, :] - batch['cycle'][:, None] >= 5)).to(device)
+                scores = model.hi_head(output['mu_i'])
+                losses = training_loss(model.hi_head, representation_weights(config), x=x, mask=mask,
+                                       output=output, r_early=scores[pair[:, 0]], r_late=scores[pair[:, 1]],
+                                       sigma_x_squared=settings['sigma_x_squared'])
                 if not all(torch.isfinite(value).item() for value in losses.values()):
                     raise RuntimeError(f"Nonfinite Stage 1 loss at epoch {epoch}; no configuration changed")
                 losses["loss"].backward()
@@ -134,6 +145,8 @@ def train_representation(config, smoke):
                   "state_dict": state, "training_indices": indices, "training_flights_total": len(dataset),
                   "device": str(device), "hi_head_unchanged": True,
                   "verification": {"indices": probe_indices, "posterior_before_save": posterior}}
+    checkpoint.update({"structure": config["model"], "training_mode": "representation",
+                       "loss_weights": representation_weights(config), "hi_minmax": None})
     path = run_dir / "representation.pt"
     torch.save(checkpoint, path)
     loaded, _ = load_representation(path, device)
@@ -215,11 +228,19 @@ def sample_pairs(pools, count):
 
 def load_ocald(path, device):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint["stage"] != "hi":
-        raise ValueError("Expected an HI checkpoint")
-    validate_hi_config(checkpoint["config"])
-    model = OCALD(checkpoint["config"])
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    stage = checkpoint['stage']
+    if stage == 'hi':
+        validate_hi_config(checkpoint['config'])
+    elif stage == 'joint':
+        validate_joint_config(checkpoint['config'])
+        if checkpoint['loss_weights'] != checkpoint['config']['training']['joint']['loss_weights']:
+            raise ValueError('Joint checkpoint weights differ from its configuration snapshot')
+    elif stage in ('ocald_no_kli', 'ocald_s2'):
+        validate_hi_config(checkpoint['config'])
+    else:
+        raise ValueError('Expected an HI or joint checkpoint')
+    model = OCALD(checkpoint['config'])
+    model.load_state_dict(checkpoint['state_dict'], strict=True)
     model.to(device).eval()
     freeze_representation(model)
     return model, checkpoint
@@ -269,17 +290,18 @@ def train_hi(config, representation_path, smoke):
     optimizer = torch.optim.Adam(model.hi_head.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
     last_pairs = None
     with (run_dir / "losses.csv").open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=["stage", "mode", "epoch", "pairs", "loss", "order", "l2"])
+        writer = csv.DictWriter(stream, fieldnames=["stage", "mode", "epoch", "pairs", "loss", "reconstruction", "kl_i", "kl_c", "order", "l2"])
         writer.writeheader()
         for epoch in range(1, epochs + 1):
             model.hi_head.train()
             pairs = sample_pairs(pools, len(dataset))
-            totals = {key: 0.0 for key in ("loss", "order", "l2")}
+            totals = {key: 0.0 for key in ("loss", "reconstruction", "kl_i", "kl_c", "order", "l2")}
             for start in range(0, len(pairs), settings["batch_size_pairs"]):
                 pair = pairs[start:start + settings["batch_size_pairs"]]
                 optimizer.zero_grad(set_to_none=True)
-                losses = hi_loss(model.hi_head(means[pair[:, 0]]), model.hi_head(means[pair[:, 1]]),
-                                 model.hi_head, settings["kappa"], settings["l2_coefficient"])
+                losses = training_loss(model.hi_head, hi_weights(config),
+                                       r_early=model.hi_head(means[pair[:, 0]]),
+                                       r_late=model.hi_head(means[pair[:, 1]]), kappa=settings['kappa'])
                 if not all(torch.isfinite(value).item() for value in losses.values()):
                     raise RuntimeError(f"Nonfinite HI loss at epoch {epoch}; no configuration changed")
                 losses["loss"].backward()
@@ -321,6 +343,7 @@ def train_hi(config, representation_path, smoke):
                   "verification": {"representation_before": before, "initial_head": initial_head, "last_pairs": last_pairs,
                                    "train_hi_raw": train_hi_raw, "units": units.cpu(), "cycles": cycles.cpu(),
                                    "probe_hi_before_save": probe_hi}}
+    checkpoint.update({"structure": config["model"], "training_mode": "hi", "loss_weights": hi_weights(config)})
     path = run_dir / "ocald.pt"
     torch.save(checkpoint, path)
     restored, _ = load_ocald(path, device)
@@ -332,21 +355,263 @@ def train_hi(config, representation_path, smoke):
     return path
 
 
+def state_hash(state):
+    return hashlib.sha256(b''.join(v.detach().cpu().numpy().tobytes() for v in state.values())).hexdigest()
+
+def datasets_for(processed, smoke):
+    datasets = {}
+    for split in ('dev', 'test'):
+        dataset = FlightDataset(processed, split)
+        expected = list(range(1, 10)) if split == 'dev' else list(range(10, 16))
+        if sorted({f['unit'] for f in dataset.flights}) != expected:
+            raise ValueError(f'Unexpected {split} unit set')
+        keys = [(f['unit'], f['cycle']) for f in dataset.flights]
+        if len(keys) != len(set(keys)):
+            raise ValueError('Duplicate flight keys')
+        if smoke:
+            selected = []
+            for unit in expected:
+                flights = sorted((f for f in dataset.flights if f['unit'] == unit), key=lambda f: f['cycle'])
+                indices = np.unique(np.linspace(0, len(flights) - 1, min(8, len(flights))).round().astype(int))
+                selected.extend(flights[i] for i in indices)
+            dataset.flights = selected
+        datasets[split] = dataset
+    return datasets
+
+def move_batch(flights, device):
+    return {key: value.to(device) for key, value in collate_fn(flights).items()}
+
+def joint_schedule(flights, epochs, batches, seed):
+    units = torch.tensor([f['unit'] for f in flights])
+    cycles = torch.tensor([f['cycle'] for f in flights])
+    groups = [torch.where(units == unit)[0] for unit in torch.unique(units)]
+    if len(groups) < 4 or any(len(g) < 4 or cycles[g].max() - cycles[g].min() < 5 for g in groups):
+        raise ValueError('Grouped sampling needs >=4 units with >=4 flights and valid cycle gaps')
+    flight_rng = torch.Generator().manual_seed(seed)
+    batch_list, pair_list = [], []
+    # Existing sampler uses global CPU RNG; isolate it from initialization/noise.
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(seed)
+        for _ in range(epochs * batches):
+            selections = []
+            for group_index in torch.randperm(len(groups), generator=flight_rng)[:4]:
+                group = groups[int(group_index)]
+                while True:
+                    selected = group[torch.randperm(len(group), generator=flight_rng)[:4]]
+                    if cycles[selected].max() - cycles[selected].min() >= 5:
+                        selections.append(selected)
+                        break
+            indices = torch.cat(selections)
+            u, c = units[indices], cycles[indices]
+            assert len(torch.unique(indices)) == 16
+            assert torch.unique(u, return_counts=True)[1].tolist() == [4] * 4
+            pairs = sample_pairs(valid_pair_pools(u, c, 5), 16)
+            assert (u[pairs[:, 0]] == u[pairs[:, 1]]).all()
+            assert (c[pairs[:, 1]] - c[pairs[:, 0]] >= 5).all()
+            batch_list.append(indices)
+            pair_list.append(pairs)
+    return {'flights': torch.stack(batch_list).reshape(epochs, batches, 16),
+            'pairs': torch.stack(pair_list).reshape(epochs, batches, 16, 2)}
+
+def encoder_order_norm(model, order):
+    params = list(model.sensor_encoder.parameters())
+    grads = torch.autograd.grad(order, params, retain_graph=True, allow_unused=True)
+    # Variance/C output heads are not on the ranking path; GRU and mu_I are.
+    names = list(model.sensor_encoder.named_parameters())
+    for (name, _), grad in zip(names, grads):
+        if name.startswith(('gru.', 'mu_i.')) and grad is None:
+            raise RuntimeError(f'Missing ranking gradient: {name}')
+    valid = [g for g in grads if g is not None]
+    if not valid or not all(torch.isfinite(g).all() for g in valid):
+        raise RuntimeError('Invalid encoder ranking gradients')
+    return torch.stack([g.detach().square().sum() for g in valid]).sum().sqrt().item()
+
+def check_mechanisms(config, batch, pairs):
+    model = OCALD(config).to(batch['x'].device)
+    model.train()  # cuDNN GRU backward requires a training-mode forward.
+    original_mask = batch['mask'].clone()
+    output = model(batch['x'], batch['w'], batch['mask'])
+    r = model.hi_head(output['mu_i'])
+    order = order_loss(r[pairs[:, 0]], r[pairs[:, 1]], 1)
+    norm = encoder_order_norm(model, order)
+    if norm <= 0:
+        raise RuntimeError('Ranking gradient did not reach encoder')
+    other = list(model.decoder.parameters()) + list(model.conditional_prior.parameters())
+    assert all(g is None for g in torch.autograd.grad(order, other, allow_unused=True, retain_graph=True))
+    losses = representation_loss(batch['x'], batch['mask'], output, 1)
+    torch.testing.assert_close(losses['loss'], losses['reconstruction'] + losses['kl_i'] + losses['kl_c'])
+    before = reconstruction_loss(batch['x'], output['x_hat'], batch['mask'], 1)
+    changed_x = batch['x'].masked_fill(~batch['mask'][:, :, None], float('nan'))
+    changed_prediction = output['x_hat'].masked_fill(~batch['mask'][:, :, None], float('nan'))
+    torch.testing.assert_close(before, reconstruction_loss(changed_x, changed_prediction, batch['mask'], 1), rtol=0, atol=0)
+    model.eval()
+    with torch.no_grad():
+        posterior = model.encode(batch['x'], batch['mask'])
+        for a, b in zip(posterior, model.encode(changed_x, batch['mask'])):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        extended_mask = F.pad(batch['mask'], (0, 8), value=False)
+        extended_x = F.pad(batch['x'], (0, 0, 0, 8), value=123)
+        for a, b in zip(posterior, model.encode(extended_x, extended_mask)):
+            torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-6)
+        mu_i, _, mu_c, _ = posterior
+        baseline = model.decode(mu_i, mu_c, time_positions(batch['mask']))
+        extended = model.decode(mu_i, mu_c, time_positions(extended_mask))
+        torch.testing.assert_close(baseline[batch['mask']], extended[extended_mask], rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(model.predict_hi(batch['x'], batch['mask']), model.predict_hi(extended_x, extended_mask), rtol=1e-6, atol=1e-6)
+    assert torch.equal(batch['mask'], original_mask)
+    assert (batch['unit'][pairs[:, 0]] == batch['unit'][pairs[:, 1]]).all()
+    assert (batch['cycle'][pairs[:, 1]] - batch['cycle'][pairs[:, 0]] >= 5).all()
+    assert order_loss(torch.tensor([0.]), torch.tensor([1.]), 1) < order_loss(torch.tensor([1.]), torch.tensor([0.]), 1)
+    print(f'PASS: OCALD pair/mask/base-loss/path checks; encoder ranking gradient norm={norm:.9g}', flush=True)
+    return {'initial_encoder_order_gradient_norm': norm, 'mask_padding_checked': True,
+            'order_only_decoder_prior_gradients_absent': True, 'pair_direction_checked': True}
+
+
+def representation_weights(config):
+    settings = config['training']['representation']
+    return {'reconstruction': 1., 'kl_i': settings['kl_i_weight'], 'kl_c': settings['kl_c_weight'], 'order': 0., 'l2': 0.}
+
+
+def hi_weights(config):
+    return {'reconstruction': 0., 'kl_i': 0., 'kl_c': 0., 'order': 1., 'l2': config['training']['hi']['l2_coefficient']}
+
+
+def validate_joint_config(config):
+    validate_hi_config(config)
+    if 'joint' not in config['training']:
+        raise ValueError('Joint training requires a training.joint configuration')
+    settings = config['training']['joint']
+    expected = {'optimizer': 'Adam', 'learning_rate': .001, 'weight_decay': 0., 'batch_size': 16,
+                'epochs': 100, 'sigma_x_squared': 1., 'gradient_clip_norm': 5., 'kappa': 1.,
+                'min_cycle_gap': 5, 'pairs_per_batch': 16, 'batch_scheme': 'grouped',
+                'units_per_batch': 4, 'flights_per_unit': 4}
+    if {k: v for k, v in settings.items() if k != 'loss_weights'} != expected:
+        raise ValueError('Joint training settings differ from the approved grouped pipeline')
+    weights = settings['loss_weights']
+    if set(weights) != {'reconstruction', 'kl_i', 'kl_c', 'order', 'l2'}:
+        raise ValueError('Missing joint loss weights')
+    if any(not np.isfinite(v) or v < 0 for v in weights.values()):
+        raise ValueError('Loss weights must be finite and nonnegative')
+    if config['smoke']['joint_epochs'] != 3 or config['smoke']['joint_batches_per_epoch'] != 2 or config['smoke']['joint_flights_per_unit'] != 8:
+        raise ValueError('Joint smoke budget differs from the approved settings')
+
+
+def train_joint(config, smoke):
+    validate_joint_config(config)
+    settings = config['training']['joint']
+    weights = settings['loss_weights']
+    seed = config['training']['seed']
+    processed = load_processed(config)
+    datasets = datasets_for(processed, smoke)
+    epochs = config['smoke']['joint_epochs'] if smoke else settings['epochs']
+    batches = config['smoke']['joint_batches_per_epoch'] if smoke else math.ceil(len(datasets['dev'])/settings['batch_size'])
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        torch.set_num_threads(1)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    root = Path(config['output']['root'])/f'joint_{"smoke" if smoke else "full"}_{stamp}'
+    root.mkdir(parents=True, exist_ok=False)
+    (root/'config.yaml').write_text(yaml.safe_dump(config, sort_keys=False))
+    schedule = joint_schedule(datasets['dev'].flights, epochs, batches, seed)
+    torch.save(schedule, root/'sampling_schedule.pt')
+    batch = move_batch([datasets['dev'].flights[i] for i in schedule['flights'][0,0].tolist()], device)
+    checks = check_mechanisms(config, batch, schedule['pairs'][0,0].to(device))
+    # Restore the original joint initialization/noise rule after mechanism checks.
+    torch.manual_seed(seed)
+    model = OCALD(config).to(device)
+    initial = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    optimizer = torch.optim.Adam(model.parameters(), lr=settings['learning_rate'], weight_decay=settings['weight_decay'])
+    logs = []
+    print(f'Stage=joint device={device} epochs={epochs} weights={weights} run_dir={root}', flush=True)
+    for epoch in range(epochs):
+        model.train()
+        totals = dict.fromkeys(('loss','reconstruction','kl_i','kl_c','order','l2'), 0.)
+        clips = []
+        order_norm = None
+        for step, (indices, cpu_pairs) in enumerate(zip(schedule['flights'][epoch],schedule['pairs'][epoch])):
+            batch = move_batch([datasets['dev'].flights[i] for i in indices.tolist()],device)
+            pairs = cpu_pairs.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            output = model(batch['x'],batch['w'],batch['mask'])
+            r = model.hi_head(output['mu_i'])
+            terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
+                                  r_early=r[pairs[:,0]],r_late=r[pairs[:,1]],
+                                  sigma_x_squared=settings['sigma_x_squared'],kappa=settings['kappa'])
+            if not all(torch.isfinite(v) for v in terms.values()):
+                raise RuntimeError('Nonfinite joint loss; no silent numerical fallback')
+            if step == 0:
+                order_norm = encoder_order_norm(model,terms['order'])
+                if epoch == 0 and order_norm <= 0:
+                    raise RuntimeError('Ranking gradient failed to reach GRU/mu_I')
+            terms['loss'].backward()
+            clips.append(torch.nn.utils.clip_grad_norm_(model.parameters(),settings['gradient_clip_norm'],error_if_nonfinite=True).item())
+            optimizer.step()
+            for key in totals:
+                totals[key] += terms[key].detach().item()
+        logs.append({'epoch':epoch+1,**{k:v/batches for k,v in totals.items()},
+                     'encoder_order_grad_norm':order_norm,'mean_preclip_grad_norm':float(np.mean(clips))})
+        pd.DataFrame(logs).to_csv(root/'losses.csv',index=False,float_format='%.17g')
+        if epoch == 0 or (epoch+1)%10 == 0 or epoch+1 == epochs:
+            print(f'epoch={epoch+1}/{epochs}: '+ ' '.join(f'{k}={logs[-1][k]:.6f}' for k in totals),flush=True)
+    rng = torch.cuda.get_rng_state(device) if device.type == 'cuda' else torch.get_rng_state()
+    digest = hashlib.sha256(rng.numpy().tobytes()).hexdigest()
+    model.eval()
+    raw = {}
+    for split,dataset in datasets.items():
+        means,_,_ = extract_training_means(model,dataset,16,device)
+        with torch.no_grad():
+            raw[split] = torch.sigmoid(-model.hi_head(means)).cpu()
+        if not torch.isfinite(raw[split]).all():
+            raise RuntimeError('Nonfinite final raw HI')
+    scale = {'min':raw['dev'].min().item(),'max':raw['dev'].max().item(),'count':len(raw['dev']),'fit_split':'dev'}
+    saved = {'stage':'joint','training_mode':'joint','structure':config['model'],
+             'mode':'smoke' if smoke else 'full','epoch':epochs,'seed':seed,'config':config,
+             'loss_weights':weights,'actual_training':{**settings,'epochs':epochs,'seed':seed},
+             'normalization':processed['normalization'],'columns':processed['columns'],
+             'state_dict':{k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
+             'initial_state_dict':initial,'initial_sha256':state_hash(initial),
+             'reparameterization_rng_digest':digest,'raw_hi':raw,'hi_minmax':scale,
+             'flight_keys':{s:[[f['unit'],f['cycle']] for f in d.flights] for s,d in datasets.items()}}
+    torch.save(saved,root/'checkpoint.pt')
+    (root/'verification.json').write_text(json.dumps(checks,indent=2)+'\n')
+    restored,_ = load_ocald(root/'checkpoint.pt',device)
+    for split,dataset in datasets.items():
+        means,_,_ = extract_training_means(restored,dataset,16,device)
+        with torch.no_grad():
+            torch.testing.assert_close(torch.sigmoid(-restored.hi_head(means)).cpu(),raw[split],rtol=0,atol=0)
+    print(f'PASS: joint last checkpoint exact reload; checkpoint={root/"checkpoint.pt"}',flush=True)
+    return root/'checkpoint.pt'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--stage", required=True, choices=["representation", "hi"])
-    parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--representation")
+    parser.add_argument('--config', required=True)
+    parser.add_argument('--pipeline',choices=['two_stage','joint'])
+    parser.add_argument('--stage',choices=['representation','hi','joint'],help='Optional individual-stage entry (legacy compatible)')
+    parser.add_argument('--smoke',action='store_true')
+    parser.add_argument('--representation')
     args = parser.parse_args()
+    if args.pipeline and args.stage:
+        parser.error('Choose --pipeline or --stage, not both')
     config = load_config(args.config)
-    if args.stage == "representation":
-        train_representation(config, args.smoke)
-    else:
+    if not torch.cuda.is_available():
+        torch.set_num_threads(1)
+    flow = args.stage or args.pipeline or config['training'].get('pipeline','two_stage')
+    if flow not in ('representation', 'hi', 'joint', 'two_stage'):
+        parser.error('Unknown configured pipeline')
+    if flow == 'representation':
+        path = train_representation(config,args.smoke)
+    elif flow == 'hi':
         if args.representation is None:
-            parser.error("hi requires --representation")
-        train_hi(config, args.representation, args.smoke)
+            parser.error('hi requires --representation')
+        path = train_hi(config,args.representation,args.smoke)
+    elif flow == 'joint':
+        path = train_joint(config,args.smoke)
+    else:
+        representation = train_representation(config,args.smoke)
+        path = train_hi(config,representation,args.smoke)
+    print(f'Pipeline complete; checkpoint={path}',flush=True)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

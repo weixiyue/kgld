@@ -20,14 +20,19 @@ def reconstruction_loss(x, x_hat, mask, sigma_x_squared):
     return residual.square().sum(dim=(1, 2)) / (2 * sigma_x_squared)
 
 
-def representation_loss(x, mask, output, sigma_x_squared):
+def representation_loss(x, mask, output, sigma_x_squared, weights=None):
     reconstruction = reconstruction_loss(x, output["x_hat"], mask, sigma_x_squared)
     kl_i = diagonal_gaussian_kl(output["mu_i"], output["logvar_i"],
                                torch.zeros_like(output["mu_i"]), torch.zeros_like(output["logvar_i"]))
     kl_c = diagonal_gaussian_kl(output["mu_c"], output["logvar_c"],
                                output["prior_mu_c"], output["prior_logvar_c"])
-    return {"loss": (reconstruction + kl_i + kl_c).mean(),
-            "reconstruction": reconstruction.mean(), "kl_i": kl_i.mean(), "kl_c": kl_c.mean()}
+    terms = {"reconstruction": reconstruction.mean(), "kl_i": kl_i.mean(), "kl_c": kl_c.mean()}
+    if weights is None or all(weights[key] == 1 for key in terms):
+        loss = (reconstruction + kl_i + kl_c).mean()
+    else:
+        active = [weights[key] * value for key, value in terms.items() if weights[key] != 0]
+        loss = sum(active[1:], active[0]) if active else reconstruction.new_zeros(())
+    return {"loss": loss, **terms}
 
 
 def order_loss(r_early, r_late, kappa):
@@ -43,6 +48,38 @@ def head_l2(hi_head):
 def hi_loss(r_early, r_late, hi_head, kappa, l2_coefficient):
     if l2_coefficient < 0:
         raise ValueError("l2_coefficient must be nonnegative")
-    order = order_loss(r_early, r_late, kappa)
-    l2 = head_l2(hi_head)
-    return {"loss": order + l2_coefficient * l2, "order": order, "l2": l2}
+    weights = {'reconstruction': 0., 'kl_i': 0., 'kl_c': 0., 'order': 1., 'l2': l2_coefficient}
+    terms = training_loss(hi_head, weights, r_early=r_early, r_late=r_late, kappa=kappa)
+    return {key: terms[key] for key in ('loss', 'order', 'l2')}
+
+
+def training_loss(head, weights, *, x=None, mask=None, output=None,
+                  r_early=None, r_late=None, sigma_x_squared=1., kappa=1.):
+    """One objective for the three flows; log raw terms, exclude zero-weight graphs.
+
+    Unavailable terms (e.g. reconstruction in frozen Stage 2) are zero. Stage 1
+    retains its original per-flight sum before averaging, including rounding.
+    """
+    keys = ('reconstruction', 'kl_i', 'kl_c', 'order', 'l2')
+    if set(weights) != set(keys) or any(not torch.isfinite(torch.tensor(v)) or v < 0 for v in weights.values()):
+        raise ValueError('Loss weights must specify five finite nonnegative coefficients')
+    zero = next(head.parameters()).new_zeros(())
+    terms = dict.fromkeys(keys, zero)
+    active = []
+    if output is not None:
+        representation = representation_loss(x, mask, output, sigma_x_squared, weights)
+        terms.update({key: representation[key] for key in keys[:3]})
+        if any(weights[key] for key in keys[:3]):
+            active.append(representation['loss'])
+    elif any(weights[key] for key in keys[:3]):
+        raise ValueError('Representation inputs are required for nonzero representation weights')
+    if r_early is not None and r_early.numel():
+        terms['order'] = order_loss(r_early, r_late, kappa)
+    elif weights['order']:
+        raise ValueError('A nonzero order weight requires valid pairs')
+    terms['l2'] = head_l2(head)
+    for key in ('order', 'l2'):
+        if weights[key]:
+            active.append(weights[key] * terms[key])
+    loss = sum(active[1:], active[0]) if active else zero
+    return {'loss': loss, **terms}

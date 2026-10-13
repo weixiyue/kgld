@@ -27,28 +27,16 @@ def attach_references(predictions, hi, rul):
     return result.sort_values(keys).reset_index(drop=True)
 
 
-def predict_table(config, checkpoint_path):
+def predict_table(config=None, checkpoint_path=None):
+    if checkpoint_path is None:
+        checkpoint_path = config
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
         torch.set_num_threads(1)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    diagnostic = checkpoint.get("stage") in ("ocald_no_kli", "ocald_s2")
-    if diagnostic:
-        from model import OCALD
-        from train import validate_hi_config
-        validate_hi_config(checkpoint["config"])
-        model = OCALD(checkpoint["config"]).to(device).eval()
-        model.load_state_dict(checkpoint["state_dict"], strict=True)
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        if checkpoint["stage"] == "ocald_no_kli":
-            expected = {"kl_i_weight": 0., "kl_c_weight": 1., "lambda": 10., "seed": 42}
-            if any(checkpoint["actual_training"][key] != value for key, value in expected.items()):
-                raise ValueError("Unexpected no-KL_I diagnostic settings")
-    else:
-        model, checkpoint = load_ocald(checkpoint_path, device)
-    if checkpoint["config"] != config:
-        raise ValueError("Evaluation configuration differs from checkpoint")
+    model, checkpoint = load_ocald(checkpoint_path, device)
+    # The saved snapshot is authoritative. The first argument remains for old callers.
+    config = checkpoint['config']
+    diagnostic = checkpoint.get('stage') in ('joint', 'ocald_no_kli', 'ocald_s2')
     processed = load_processed(config)
     if checkpoint["columns"] != processed["columns"]:
         raise ValueError("Checkpoint columns differ from prepared data")
@@ -94,13 +82,13 @@ def predict_table(config, checkpoint_path):
 def metric_report(table, checkpoint):
     from metrics import evaluate_metrics
 
-    diagnostic = checkpoint.get("stage") in ("ocald_no_kli", "ocald_s2")
+    diagnostic = checkpoint.get("stage") in ("joint", "ocald_no_kli", "ocald_s2")
     if diagnostic:
         result = {"stage": "diagnostic_evaluation", "diagnostic_type": checkpoint["stage"],
                   "mode": checkpoint["mode"], "joint_epoch": checkpoint["epoch"],
                   "seed": checkpoint["seed"], "hi_minmax": checkpoint["hi_minmax"],
-                  "actual_training": checkpoint.get("actual_training", {"lambda": checkpoint["lambda"],
-                                      "kl_i_weight": 1., "kl_c_weight": 1., "seed": checkpoint["seed"]}),
+                  "actual_training": checkpoint['actual_training'] if 'actual_training' in checkpoint else
+                                      {"lambda": checkpoint["lambda"], "kl_i_weight": 1., "kl_c_weight": 1., "seed": checkpoint["seed"]},
                   "reference_commit": "157ebfae7baeee1e0cd52180f8e58ead3dcb448e", "splits": {}}
     else:
         result = {"stage": "evaluation", "mode": checkpoint["mode"], "source_mode": checkpoint["source_mode"],
@@ -184,7 +172,7 @@ def evaluate(config, checkpoint_path, output_dir=None):
     run_dir = Path(checkpoint_path).parent if output_dir is None else Path(output_dir)
     if output_dir is not None:
         run_dir.mkdir(parents=True, exist_ok=False)
-    if checkpoint.get("stage") in ("ocald_no_kli", "ocald_s2"):
+    if checkpoint.get("stage") in ("joint", "ocald_no_kli", "ocald_s2"):
         if any((run_dir / name).exists() for name in ("predictions.csv", "metrics.json", "hi_curves.png")):
             raise ValueError("Refusing to overwrite diagnostic evaluation artifacts; supply a new output directory")
     csv_path = run_dir / "predictions.csv"
@@ -204,11 +192,11 @@ def evaluate(config, checkpoint_path, output_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", help="Legacy argument; evaluation uses the checkpoint configuration snapshot")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", help="Export to a new directory, e.g. for read-only diagnostic comparison")
     args = parser.parse_args()
-    evaluate(load_config(args.config), args.checkpoint, args.output_dir)
+    evaluate(None, args.checkpoint, args.output_dir)
 
 
 if __name__ == "__main__":

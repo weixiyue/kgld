@@ -602,9 +602,94 @@ def plot_data(config, split, unit, cycle, parameters):
     print("PASS: T1 data plot (normalized flight parameters and full reference HI)")
 
 
+def verify_pipeline(config, checkpoint_path=None):
+    """Lightweight unified-loss/path checks and optional saved-joint verification."""
+    import json
+    import pandas as pd
+    from losses import training_loss, reconstruction_loss, representation_loss
+    from model import OCALD
+    from train import (datasets_for, joint_schedule, move_batch, encoder_order_norm,
+                       representation_weights, hi_weights, freeze_representation,
+                       load_ocald, extract_training_means, state_hash)
+    from evaluate import predict_table, metric_report
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        torch.set_num_threads(1)
+    processed = load_processed(config)
+    datasets = datasets_for(processed, True)
+    schedule = joint_schedule(datasets['dev'].flights, 3, 2, 42)
+    batch = move_batch([datasets['dev'].flights[i] for i in schedule['flights'][0,0].tolist()], device)
+    pairs = schedule['pairs'][0,0].to(device)
+    torch.manual_seed(42)
+    model = OCALD(config).to(device).train()
+    output = model(batch['x'], batch['w'], batch['mask'])
+    scores = model.hi_head(output['mu_i'])
+    for ki in (0., 1.):
+        weights = {'reconstruction':1., 'kl_i':ki, 'kl_c':1., 'order':10., 'l2':1e-4}
+        terms = training_loss(model.hi_head,weights,x=batch['x'],mask=batch['mask'],output=output,
+                              r_early=scores[pairs[:,0]],r_late=scores[pairs[:,1]])
+        expected = terms['reconstruction']+ki*terms['kl_i']+terms['kl_c']+10*terms['order']+1e-4*terms['l2']
+        torch.testing.assert_close(terms['loss'],expected,rtol=1e-6,atol=1e-5)
+        assert terms['kl_i'].item() > 0
+        if ki == 0:
+            assert torch.autograd.grad(terms['loss'],terms['kl_i'],allow_unused=True,retain_graph=True)[0] is None
+        grads = torch.autograd.grad(terms['loss'],tuple(model.conditional_prior.parameters()),retain_graph=True)
+        assert all(torch.isfinite(g).all() for g in grads) and sum(g.square().sum().item() for g in grads)>0
+        assert encoder_order_norm(model,terms['order']) > 0
+    stage1 = training_loss(model.hi_head,representation_weights(config),x=batch['x'],mask=batch['mask'],output=output)
+    torch.testing.assert_close(stage1['loss'],representation_loss(batch['x'],batch['mask'],output,1.)['loss'],rtol=0,atol=0)
+    changed_x = batch['x'].masked_fill(~batch['mask'][:,:,None],float('nan'))
+    changed_hat = output['x_hat'].masked_fill(~batch['mask'][:,:,None],float('nan'))
+    torch.testing.assert_close(reconstruction_loss(changed_x,changed_hat,batch['mask'],1.),
+                               reconstruction_loss(batch['x'],output['x_hat'],batch['mask'],1.),rtol=0,atol=0)
+    model.zero_grad(set_to_none=True)
+    freeze_representation(model)
+    with torch.no_grad():
+        mean = model.encode(batch['x'],batch['mask'])[0]
+    r = model.hi_head(mean)
+    stage2 = training_loss(model.hi_head,hi_weights(config),r_early=r[pairs[:,0]],r_late=r[pairs[:,1]])
+    stage2['loss'].backward()
+    assert all(p.grad is None and not p.requires_grad for name in ('sensor_encoder','conditional_prior','decoder') for p in getattr(model,name).parameters())
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.hi_head.parameters())
+    if checkpoint_path is not None:
+        restored,saved = load_ocald(checkpoint_path,device)
+        prepared = load_processed(saved['config'])
+        data = FlightDataset(prepared,'dev')
+        if 'flight_keys' in saved:
+            lookup = {(f['unit'],f['cycle']):f for f in data.flights}
+            data.flights = [lookup[tuple(key)] for key in saved['flight_keys']['dev']]
+        if 'initial_state_dict' in saved:
+            torch.manual_seed(saved['seed'])
+            initial = OCALD(saved['config'])
+            for key,value in initial.state_dict().items():
+                torch.testing.assert_close(value,saved['initial_state_dict'][key],rtol=0,atol=0)
+            assert state_hash(saved['initial_state_dict']) == saved['initial_sha256']
+        schedule_path = Path(checkpoint_path).with_name('sampling_schedule.pt')
+        if schedule_path.exists():
+            plan = torch.load(schedule_path,map_location='cpu',weights_only=True)
+            fresh = joint_schedule(data.flights,saved['epoch'],plan['flights'].shape[1],saved['seed'])
+            assert all(torch.equal(plan[key],fresh[key]) for key in fresh)
+        means,_,_ = extract_training_means(restored,data,16,device)
+        with torch.no_grad():
+            raw = torch.sigmoid(-restored.hi_head(means)).cpu()
+        recorded = saved['verification']['train_hi_raw'] if saved['stage']=='hi' else saved['raw_hi']['dev']
+        torch.testing.assert_close(raw,recorded,rtol=0,atol=0)
+        assert saved['hi_minmax'] == {'min':raw.min().item(),'max':raw.max().item(),'count':len(data),'fit_split':'dev'}
+        predictions_path = Path(checkpoint_path).with_name('predictions.csv')
+        if predictions_path.exists():
+            fresh,loaded = predict_table(None,checkpoint_path)
+            disk = pd.read_csv(predictions_path,float_precision='round_trip')
+            assert fresh[['split','unit','cycle']].equals(disk[['split','unit','cycle']])
+            for field in ('hi_raw','hi_scaled','hi_gt','rul'):
+                np.testing.assert_allclose(fresh[field],disk[field],rtol=0,atol=0,equal_nan=True)
+            assert metric_report(disk,loaded) == json.loads(Path(checkpoint_path).with_name('metrics.json').read_text())
+    print('PASS: unified pipeline loss weights, zero-weight recording/path, mask, freeze, initialization, schedule, checkpoint and evaluation')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation", "hi", "metrics", "evaluation"])
+    parser.add_argument("--task", required=True, choices=["data", "data-plot", "model", "representation", "hi", "metrics", "evaluation", "pipeline"])
     parser.add_argument("--config", required=True)
     parser.add_argument("--split", choices=["dev", "test"])
     parser.add_argument("--unit", type=int)
@@ -614,7 +699,9 @@ def main():
     parser.add_argument("--run-dir")
     args = parser.parse_args()
     config = load_config(args.config)
-    if args.task == "data":
+    if args.task == "pipeline":
+        verify_pipeline(config,args.checkpoint)
+    elif args.task == "data":
         verify_data(config)
     elif args.task == "model":
         verify_model(config)
