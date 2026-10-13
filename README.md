@@ -433,3 +433,31 @@ A 重构/MSE 关系及 L2 分项；NumPy 小样本核对统计/分位数，并�
 representation 使用上述 checkpoint，hi/evaluation 使用
 `outputs/hi_formal_20261010T104138118262Z/`。data-plot 以该验证目录中的临时配置改变
 仅输出路径，没有改 `config.yaml` 或覆盖既有图。未重新执行正式训练、预处理或评价导出。
+
+## 13. 诊断维护记录
+
+E3 编码器隔离诊断已归档至 `outputs/diagnostic_archive/e3/`，原运行目录及专用代码已清理。
+来源为本地提交 `e032102`、DS03 完整 flight、seed=42，各100轮排序训练及mu_I探针。
+历史 T1 GRU 的 dev/test 排序正确率为94.18%/94.35%，T2卷积为98.60%/97.12%；排序基于r，
+T2的Sigmoid HI全部饱和为0，scaled不可用。单种子排序表现不证明HI尺度有效，不定位唯一
+根因，也不证明物理解耦。设置、日志、预测、指标及SHA256清单保存在归档中；此处不是运行入口。
+
+取消KL_I消融使用 `ocald_no_kli.py`，仅seed42、lambda10：
+`reconstruction + KL_C + 10*order + 1e-4*head_L2`，KL_I只记录。这是联合消融目标，
+不是标准负ELBO，不是正式两阶段训练；正式OCALD结构、配置与两阶段行为保持原样。
+
+```bash
+python ocald_no_kli.py --config config.yaml --smoke
+python ocald_no_kli.py --config config.yaml
+python ocald_no_kli.py --verify-only --run-dir outputs/ocald_no_kli/实际时间戳
+```
+
+输出位于新建的 `outputs/ocald_no_kli/<时间戳>/`。使用evaluate.py的预测、键关联、六项
+raw/scaled指标和曲线；允许诊断HI有限端点并报告饱和，零dev极差标记scaled不可用。
+正式checkpoint仍执行原加载、开区间HI检查、指标及两阶段记录。
+原S2 lambda10/seed42通过checkpoint只读重评到新目录，缺文件则明确缺失，不重训。
+不计算/导出排序正确率，不训练探针。详见 `README_ocald_no_kli.md`。
+
+| 任务 | 状态 | 用户确认 |
+|---|---|---|
+| E3归档清理、取消KL_I | 归档71文件哈希核验、清理、smoke、唯一100轮消融、S2重评与独立检查完成 | 用户直接授权实现、清理、唯一完整实验与必要评价适配；完成验收待确认 |

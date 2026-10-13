@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,22 @@ def predict_table(config, checkpoint_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
         torch.set_num_threads(1)
-    model, checkpoint = load_ocald(checkpoint_path, device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    diagnostic = checkpoint.get("stage") in ("ocald_no_kli", "ocald_s2")
+    if diagnostic:
+        from model import OCALD
+        from train import validate_hi_config
+        validate_hi_config(checkpoint["config"])
+        model = OCALD(checkpoint["config"]).to(device).eval()
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        if checkpoint["stage"] == "ocald_no_kli":
+            expected = {"kl_i_weight": 0., "kl_c_weight": 1., "lambda": 10., "seed": 42}
+            if any(checkpoint["actual_training"][key] != value for key, value in expected.items()):
+                raise ValueError("Unexpected no-KL_I diagnostic settings")
+    else:
+        model, checkpoint = load_ocald(checkpoint_path, device)
     if checkpoint["config"] != config:
         raise ValueError("Evaluation configuration differs from checkpoint")
     processed = load_processed(config)
@@ -45,14 +61,21 @@ def predict_table(config, checkpoint_path):
     tables = []
     for split in ("dev", "test"):
         dataset = FlightDataset(processed, split)
+        if diagnostic and "flight_keys" in checkpoint:
+            lookup = {(f["unit"], f["cycle"]): f for f in dataset.flights}
+            keys = [tuple(k) for k in checkpoint["flight_keys"][split]]
+            if len(set(keys)) != len(keys):
+                raise ValueError("Duplicate diagnostic flight keys")
+            dataset.flights = [lookup[key] for key in keys]
         means, units, cycles = extract_training_means(model, dataset, config["training"]["representation"]["batch_size"], device)
         with torch.no_grad():
             raw = torch.sigmoid(-model.hi_head(means)).cpu()
-        if not torch.isfinite(raw).all() or not ((raw > 0) & (raw < 1)).all():
+        in_range = ((raw >= 0) & (raw <= 1)) if diagnostic else ((raw > 0) & (raw < 1))
+        if not torch.isfinite(raw).all() or not in_range.all():
             raise ValueError(f"Invalid raw HI in {split}")
         if split == "dev":
-            torch.testing.assert_close(raw, checkpoint["verification"]["train_hi_raw"], rtol=1e-6, atol=1e-7)
-            stored = checkpoint["verification"]["train_hi_raw"]
+            stored = checkpoint["raw_hi"]["dev"] if diagnostic else checkpoint["verification"]["train_hi_raw"]
+            torch.testing.assert_close(raw, stored, rtol=1e-6, atol=1e-7)
             if parameters != {"min": stored.min().item(), "max": stored.max().item(), "count": len(dataset), "fit_split": "dev"}:
                 raise ValueError("HI scale is not fitted on all training predictions")
         scaled = scale_hi(raw, parameters).numpy() if scaled_available else np.full(len(raw), np.nan)
@@ -60,6 +83,10 @@ def predict_table(config, checkpoint_path):
                                     "hi_raw": raw.numpy(), "hi_scaled": scaled})
         hi = read_reference(config["data"][f"hi_{split}_path"], processed[split])
         rul = read_rul(config["data"]["raw_path"], split, processed[split])
+        if diagnostic and "flight_keys" in checkpoint:
+            keys = pd.MultiIndex.from_arrays([predictions.unit, predictions.cycle], names=["unit", "cycle"])
+            hi = hi.set_index(["unit", "cycle"]).loc[keys].reset_index()
+            rul = rul.set_index(["unit", "cycle"]).loc[keys].reset_index()
         tables.append(attach_references(predictions, hi, rul))
     return pd.concat(tables, ignore_index=True), checkpoint
 
@@ -67,7 +94,16 @@ def predict_table(config, checkpoint_path):
 def metric_report(table, checkpoint):
     from metrics import evaluate_metrics
 
-    result = {"stage": "evaluation", "mode": checkpoint["mode"], "source_mode": checkpoint["source_mode"],
+    diagnostic = checkpoint.get("stage") in ("ocald_no_kli", "ocald_s2")
+    if diagnostic:
+        result = {"stage": "diagnostic_evaluation", "diagnostic_type": checkpoint["stage"],
+                  "mode": checkpoint["mode"], "joint_epoch": checkpoint["epoch"],
+                  "seed": checkpoint["seed"], "hi_minmax": checkpoint["hi_minmax"],
+                  "actual_training": checkpoint.get("actual_training", {"lambda": checkpoint["lambda"],
+                                      "kl_i_weight": 1., "kl_c_weight": 1., "seed": checkpoint["seed"]}),
+                  "reference_commit": "157ebfae7baeee1e0cd52180f8e58ead3dcb448e", "splits": {}}
+    else:
+        result = {"stage": "evaluation", "mode": checkpoint["mode"], "source_mode": checkpoint["source_mode"],
               "hi_epoch": checkpoint["epoch"], "representation_epoch": checkpoint["source_epoch"],
               "seed": checkpoint["config"]["training"]["seed"], "hi_minmax": checkpoint["hi_minmax"],
               "reference_commit": "157ebfae7baeee1e0cd52180f8e58ead3dcb448e", "splits": {}}
@@ -80,10 +116,27 @@ def metric_report(table, checkpoint):
             else:
                 if subset[column].isna().any():
                     raise ValueError("Partially missing HI scale")
-                scales[name] = {"available": True, **evaluate_metrics(subset[column].to_numpy(), subset.hi_gt.to_numpy(),
+                if diagnostic:
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        values = evaluate_metrics(subset[column].to_numpy(), subset.hi_gt.to_numpy(),
+                                                  subset.unit.to_numpy(), subset.cycle.to_numpy(),
+                                                  subset.rul.to_numpy(), result["seed"])
+                    for entries in [values["overall"], *values["per_unit"].values()]:
+                        for entry in entries.values():
+                            if not np.isfinite(entry["value"]):
+                                original = entry.get("reason")
+                                entry["value"] = None
+                                entry["reason"] = "Original metrics formula returned a nonfinite value; no epsilon or clipping" + (f"; {original}" if original else "")
+                    scales[name] = {"available": True, **values, "warnings": sorted({str(w.message) for w in caught})}
+                else:
+                    scales[name] = {"available": True, **evaluate_metrics(subset[column].to_numpy(), subset.hi_gt.to_numpy(),
                                                                         subset.unit.to_numpy(), subset.cycle.to_numpy(),
                                                                         subset.rul.to_numpy(), result["seed"])}
         result["splits"][split] = scales
+        if diagnostic:
+            result["splits"][split]["saturation"] = {"zero": int((subset.hi_raw == 0).sum()),
+                                                     "one": int((subset.hi_raw == 1).sum()), "count": len(subset)}
     return result
 
 
@@ -97,7 +150,10 @@ def plot_curves(table, report, output_path):
 
     groups = list(table.groupby(["split", "unit"], sort=True))
     figure, axes = plt.subplots(len(groups), 2, figsize=(14, 2.5 * len(groups)), layout="constrained", squeeze=False)
-    figure.suptitle(f"DS03 HI — {report['mode']} | Stage 1 {report['representation_epoch']} / Stage 2 {report['hi_epoch']} epochs")
+    if "diagnostic_type" in report:
+        figure.suptitle(f"DS03 HI — {report['diagnostic_type']} | {report['mode']} | {report['joint_epoch']} joint epochs")
+    else:
+        figure.suptitle(f"DS03 HI — {report['mode']} | Stage 1 {report['representation_epoch']} / Stage 2 {report['hi_epoch']} epochs")
     try:
         for row, ((split, unit), group) in enumerate(groups):
             group = group.sort_values("cycle")
@@ -123,9 +179,14 @@ def plot_curves(table, report, output_path):
         plt.close(figure)
 
 
-def evaluate(config, checkpoint_path):
+def evaluate(config, checkpoint_path, output_dir=None):
     table, checkpoint = predict_table(config, checkpoint_path)
-    run_dir = Path(checkpoint_path).parent
+    run_dir = Path(checkpoint_path).parent if output_dir is None else Path(output_dir)
+    if output_dir is not None:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    if checkpoint.get("stage") in ("ocald_no_kli", "ocald_s2"):
+        if any((run_dir / name).exists() for name in ("predictions.csv", "metrics.json", "hi_curves.png")):
+            raise ValueError("Refusing to overwrite diagnostic evaluation artifacts; supply a new output directory")
     csv_path = run_dir / "predictions.csv"
     table.to_csv(csv_path, index=False, float_format="%.17g")
     # Render from the exported table to preserve exact CSV/curve agreement.
@@ -145,8 +206,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--output-dir", help="Export to a new directory, e.g. for read-only diagnostic comparison")
     args = parser.parse_args()
-    evaluate(load_config(args.config), args.checkpoint)
+    evaluate(load_config(args.config), args.checkpoint, args.output_dir)
 
 
 if __name__ == "__main__":
