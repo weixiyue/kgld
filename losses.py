@@ -24,14 +24,24 @@ def representation_loss(x, mask, output, sigma_x_squared, weights=None):
     reconstruction = reconstruction_loss(x, output["x_hat"], mask, sigma_x_squared)
     kl_i = diagonal_gaussian_kl(output["mu_i"], output["logvar_i"],
                                torch.zeros_like(output["mu_i"]), torch.zeros_like(output["logvar_i"]))
-    kl_c = diagonal_gaussian_kl(output["mu_c"], output["logvar_c"],
-                               output["prior_mu_c"], output["prior_logvar_c"])
+    temporal_c = output["mu_c"].ndim == 3
+    c_parameters = [output[key] for key in ("mu_c", "logvar_c", "prior_mu_c", "prior_logvar_c")]
+    if temporal_c:
+        if any(value.shape[:2] != mask.shape for value in c_parameters):
+            raise ValueError("Temporal C parameters must align with mask")
+        # Select before Gaussian arithmetic, so invalid padding never contributes.
+        c_parameters = [value.masked_fill(~mask[:, :, None], 0) for value in c_parameters]
+    kl_c = diagonal_gaussian_kl(*c_parameters)
+    if temporal_c:
+        kl_c = kl_c.masked_fill(~mask, 0).sum(dim=1)
     terms = {"reconstruction": reconstruction.mean(), "kl_i": kl_i.mean(), "kl_c": kl_c.mean()}
     if weights is None or all(weights[key] == 1 for key in terms):
         loss = (reconstruction + kl_i + kl_c).mean()
     else:
         active = [weights[key] * value for key, value in terms.items() if weights[key] != 0]
         loss = sum(active[1:], active[0]) if active else reconstruction.new_zeros(())
+    if temporal_c:
+        terms["kl_c_per_step"] = kl_c.sum() / mask.sum()
     return {"loss": loss, **terms}
 
 
@@ -69,9 +79,12 @@ def training_loss(head, weights, *, x=None, mask=None, output=None,
     zero = next(head.parameters()).new_zeros(()) if head is not None else reference.new_zeros(())
     terms = dict.fromkeys(keys, zero)
     active = []
+    diagnostics = {}
     if output is not None:
         representation = representation_loss(x, mask, output, sigma_x_squared, weights)
         terms.update({key: representation[key] for key in keys[:3]})
+        if 'kl_c_per_step' in representation:
+            diagnostics['kl_c_per_step'] = representation['kl_c_per_step']
         if any(weights[key] for key in keys[:3]):
             active.append(representation['loss'])
     elif any(weights[key] for key in keys[:3]):
@@ -85,4 +98,4 @@ def training_loss(head, weights, *, x=None, mask=None, output=None,
         if weights[key]:
             active.append(weights[key] * terms[key])
     loss = sum(active[1:], active[0]) if active else zero
-    return {'loss': loss, **terms}
+    return {'loss': loss, **terms, **diagnostics}

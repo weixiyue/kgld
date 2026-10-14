@@ -2,7 +2,7 @@
 
 import torch
 from torch import nn
-from torch.nn.utils.rnn import pack_padded_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 HI_MAPPING_TYPE = "dev_score_reverse_minmax"
@@ -62,28 +62,60 @@ def last_valid_state(gru, sequence, mask):
     return hidden[-1]
 
 
+def sequence_states(gru, sequence, mask):
+    """Packed GRU states; unpack to the supplied padding length."""
+    lengths = valid_lengths(mask)
+    if sequence.ndim != 3 or sequence.shape[:2] != mask.shape or sequence.device != mask.device:
+        raise ValueError("Sequence and mask must share batch/time dimensions and device")
+    packed = pack_padded_sequence(sequence, lengths.cpu(), batch_first=True, enforce_sorted=False)
+    output, hidden = gru(packed)
+    states, _ = pad_packed_sequence(output, batch_first=True, total_length=mask.shape[1])
+    return hidden[-1], states
+
+
 class SensorEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_i_dim, latent_c_dim):
+    def __init__(self, input_dim, hidden_dim, latent_i_dim, latent_c_dim, c_mode="global", condition_hidden_dim=32):
         super().__init__()
+        self.c_mode = c_mode
         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
         self.mu_i = nn.Linear(hidden_dim, latent_i_dim)
         self.logvar_i = nn.Linear(hidden_dim, latent_i_dim)
-        self.mu_c = nn.Linear(hidden_dim, latent_c_dim)
-        self.logvar_c = nn.Linear(hidden_dim, latent_c_dim)
+        c_input_dim = hidden_dim + condition_hidden_dim if c_mode == "temporal" else hidden_dim
+        self.mu_c = nn.Linear(c_input_dim, latent_c_dim)
+        self.logvar_c = nn.Linear(c_input_dim, latent_c_dim)
 
     def forward(self, x, mask):
         state = last_valid_state(self.gru, x, mask)
+        if self.c_mode == "temporal":
+            return self.mu_i(state), self.logvar_i(state)
         return self.mu_i(state), self.logvar_i(state), self.mu_c(state), self.logvar_c(state)
+
+    def temporal_states(self, x, mask):
+        last, states = sequence_states(self.gru, x, mask)
+        return self.mu_i(last), self.logvar_i(last), states
+
+    def temporal_posterior(self, h, u, mask):
+        features = torch.cat((h, u), dim=-1)
+        return tuple(head(features).masked_fill(~mask[:, :, None], 0) for head in (self.mu_c, self.logvar_c))
 
 
 class ConditionalPrior(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_c_dim):
+    def __init__(self, input_dim, hidden_dim, latent_c_dim, c_mode="global"):
         super().__init__()
+        self.c_mode = c_mode
         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
         self.mu = nn.Linear(hidden_dim, latent_c_dim)
         self.logvar = nn.Linear(hidden_dim, latent_c_dim)
 
+    def temporal_states(self, w, mask):
+        _, states = sequence_states(self.gru, w, mask)
+        mu, logvar = (head(states).masked_fill(~mask[:, :, None], 0) for head in (self.mu, self.logvar))
+        return states, mu, logvar
+
     def forward(self, w, mask):
+        if self.c_mode == "temporal":
+            _, mu, logvar = self.temporal_states(w, mask)
+            return mu, logvar
         state = last_valid_state(self.gru, w, mask)
         return self.mu(state), self.logvar(state)
 
@@ -108,8 +140,14 @@ class Decoder(nn.Module):
         self.condition_dim = condition_dim
 
     def forward(self, z_i, z_c, positions, w=None):
-        latents = torch.cat((z_i, z_c), dim=-1)
-        parts = [latents[:, None, :].expand(-1, positions.shape[1], -1)]
+        if z_c.ndim == 3:
+            if z_c.shape[:2] != positions.shape:
+                raise ValueError("Temporal C must align with per-step positions")
+            latents = torch.cat((z_i[:, None, :].expand(-1, positions.shape[1], -1), z_c), dim=-1)
+            parts = [latents]
+        else:
+            latents = torch.cat((z_i, z_c), dim=-1)
+            parts = [latents[:, None, :].expand(-1, positions.shape[1], -1)]
         if self.use_w:
             if w is None or w.shape != (*positions.shape, self.condition_dim):
                 raise ValueError('W-conditioned decoder requires aligned per-step W')
@@ -132,9 +170,12 @@ class OCALD(nn.Module):
     def __init__(self, config):
         super().__init__()
         m, d = config["model"], config["data"]
+        self.c_mode = m.get("c_mode", "global")
+        if self.c_mode not in ("global", "temporal"):
+            raise ValueError("Unknown c_mode")
         approved = {
             "sensor_hidden_dim": 64, "condition_hidden_dim": 32, "gru_layers": 1,
-            "bidirectional": False, "latent_i_dim": m["latent_i_dim"], "latent_c_dim": 8,
+            "bidirectional": False, "latent_i_dim": m["latent_i_dim"], "latent_c_dim": 2 if self.c_mode == "temporal" else 8,
             "decoder_hidden_dims": [64, 64], "hi_hidden_dim": 16,
         }
         self.score_mode = m.get('score_mode', 'hi_head')
@@ -145,10 +186,12 @@ class OCALD(nn.Module):
         self.decoder_use_w = m.get('decoder_use_w', False)
         if not isinstance(self.decoder_use_w, bool):
             raise ValueError('decoder_use_w must be boolean')
-        if {k: v for k, v in m.items() if k not in ('decoder_use_w', 'score_mode')} != approved:
+        if {k: v for k, v in m.items() if k not in ('decoder_use_w', 'score_mode', 'c_mode')} != approved:
             raise ValueError("Model settings differ from approved v2 structure")
-        self.sensor_encoder = SensorEncoder(d["sensor_dim"], m["sensor_hidden_dim"], m["latent_i_dim"], m["latent_c_dim"])
-        self.conditional_prior = ConditionalPrior(d["condition_dim"], m["condition_hidden_dim"], m["latent_c_dim"])
+        if self.c_mode == "temporal" and (self.decoder_use_w or self.score_mode != "hi_head"):
+            raise ValueError("Temporal C requires 8D I/HIHead and no decoder W input")
+        self.sensor_encoder = SensorEncoder(d["sensor_dim"], m["sensor_hidden_dim"], m["latent_i_dim"], m["latent_c_dim"], self.c_mode, m["condition_hidden_dim"])
+        self.conditional_prior = ConditionalPrior(d["condition_dim"], m["condition_hidden_dim"], m["latent_c_dim"], self.c_mode)
         self.decoder = Decoder(m["latent_i_dim"], m["latent_c_dim"], m["decoder_hidden_dims"], d["sensor_dim"])
         self.hi_head = HIHead(m["latent_i_dim"], m["hi_hidden_dim"]) if self.score_mode == "hi_head" else None
         if self.decoder_use_w:
@@ -169,12 +212,21 @@ class OCALD(nn.Module):
     def predict_hi(self, x, mask, score_parameters):
         return scale_score(self.predict_score(x, mask), score_parameters)
 
-    def forward(self, x, w, mask):
-        mu_i, logvar_i, mu_c, logvar_c = self.encode(x, mask)
-        prior_mu_c, prior_logvar_c = self.conditional_prior(w, mask)
-        z_i = mu_i + torch.exp(0.5 * logvar_i) * torch.randn_like(mu_i)
-        z_c = mu_c + torch.exp(0.5 * logvar_c) * torch.randn_like(mu_c)
-        decoder_w = w.masked_fill(~mask[:, :, None], 0) if self.decoder_use_w else None
-        reconstruction = self.decode(z_i, z_c, time_positions(mask, dtype=x.dtype), decoder_w)
+    def posterior(self, x, w, mask):
+        if self.c_mode == "temporal":
+            mu_i, logvar_i, h = self.sensor_encoder.temporal_states(x, mask)
+            u, prior_mu_c, prior_logvar_c = self.conditional_prior.temporal_states(w, mask)
+            mu_c, logvar_c = self.sensor_encoder.temporal_posterior(h, u, mask)
+        else:
+            mu_i, logvar_i, mu_c, logvar_c = self.encode(x, mask)
+            prior_mu_c, prior_logvar_c = self.conditional_prior(w, mask)
         return {"mu_i": mu_i, "logvar_i": logvar_i, "mu_c": mu_c, "logvar_c": logvar_c,
-                "prior_mu_c": prior_mu_c, "prior_logvar_c": prior_logvar_c, "x_hat": reconstruction}
+                "prior_mu_c": prior_mu_c, "prior_logvar_c": prior_logvar_c}
+
+    def forward(self, x, w, mask):
+        output = self.posterior(x, w, mask)
+        z_i = output["mu_i"] + torch.exp(0.5 * output["logvar_i"]) * torch.randn_like(output["mu_i"])
+        z_c = output["mu_c"] + torch.exp(0.5 * output["logvar_c"]) * torch.randn_like(output["mu_c"])
+        decoder_w = w.masked_fill(~mask[:, :, None], 0) if self.decoder_use_w else None
+        output["x_hat"] = self.decode(z_i, z_c, time_positions(mask, dtype=x.dtype), decoder_w)
+        return output

@@ -62,8 +62,8 @@ def load_representation(path, device):
 
 def train_representation(config, smoke):
     validate_representation_config(config)
-    if config['model'].get('score_mode', 'hi_head') != 'hi_head':
-        raise ValueError('Scalar I supports joint training only')
+    if config['model'].get('score_mode', 'hi_head') != 'hi_head' or config['model'].get('c_mode', 'global') != 'global':
+        raise ValueError('Scalar I and temporal C support joint training only')
     seed = config["training"]["seed"]
     random.seed(seed)
     np.random.seed(seed)
@@ -231,6 +231,8 @@ def sample_pairs(pools, count):
 def load_ocald(path, device):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     stage = checkpoint['stage']
+    if checkpoint.get('c_mode', 'global') != checkpoint['config']['model'].get('c_mode', 'global'):
+        raise ValueError('Checkpoint c_mode mismatch')
     if checkpoint.get('score_mode', 'hi_head') != checkpoint['config']['model'].get('score_mode', 'hi_head'):
         raise ValueError('Checkpoint score_mode mismatch')
     if stage == 'hi':
@@ -254,8 +256,8 @@ def load_ocald(path, device):
 
 def train_hi(config, representation_path, smoke):
     validate_hi_config(config)
-    if config['model'].get('score_mode', 'hi_head') != 'hi_head':
-        raise ValueError('Scalar I supports joint training only')
+    if config['model'].get('score_mode', 'hi_head') != 'hi_head' or config['model'].get('c_mode', 'global') != 'global':
+        raise ValueError('Scalar I and temporal C support joint training only')
     seed = config["training"]["seed"]
     random.seed(seed)
     np.random.seed(seed)
@@ -431,6 +433,8 @@ def encoder_order_norm(model, order):
     return torch.stack([g.detach().square().sum() for g in valid]).sum().sqrt().item()
 
 def check_mechanisms(config, batch, pairs):
+    if config['model'].get('c_mode', 'global') == 'temporal':
+        return check_temporal_mechanisms(config, batch, pairs)
     model = OCALD(config).to(batch['x'].device)
     model.train()  # cuDNN GRU backward requires a training-mode forward.
     original_mask = batch['mask'].clone()
@@ -518,6 +522,82 @@ def check_mechanisms(config, batch, pairs):
             'scalar_same_forward_no_detach_no_head_checked': model.score_mode == 'scalar_i'}
 
 
+def check_temporal_mechanisms(config, batch, pairs):
+    """Real-batch temporal paths plus hand-computed masked KL sum."""
+    from losses import diagonal_gaussian_kl
+    model = OCALD(config).to(batch['x'].device).train()
+    x, w, mask = (batch[key] for key in ('x', 'w', 'mask'))
+    output = model(x, w, mask)
+    assert output['mu_i'].shape == (len(x), 8)
+    for key in ('mu_c', 'logvar_c', 'prior_mu_c', 'prior_logvar_c'):
+        assert output[key].shape == (*mask.shape, 2)
+    assert model.decoder.layers[0].in_features == 11 and not model.decoder_use_w
+    r = model.score(output['mu_i'])
+    torch.testing.assert_close(r, model.hi_head(output['mu_i']), rtol=0, atol=0)
+    terms = training_loss(model.hi_head, config['training']['joint']['loss_weights'],
+        x=x, mask=mask, output=output, r_early=r[pairs[:, 0]], r_late=r[pairs[:, 1]])
+    expected = terms['reconstruction'] + terms['kl_i'] + terms['kl_c'] + 10*terms['order'] + 1e-4*terms['l2']
+    torch.testing.assert_close(terms['loss'], expected, rtol=1e-6, atol=1e-5)
+    norm = encoder_order_norm(model, terms['order'])
+    assert norm > 0
+    excluded = tuple(model.sensor_encoder.mu_c.parameters()) + tuple(model.sensor_encoder.logvar_c.parameters()) + tuple(model.conditional_prior.parameters()) + tuple(model.decoder.parameters())
+    assert all(g is None for g in torch.autograd.grad(terms['order'], excluded, retain_graph=True, allow_unused=True))
+    paths = {
+        'kl_i': tuple(model.sensor_encoder.mu_i.parameters()) + tuple(model.sensor_encoder.logvar_i.parameters()),
+        'kl_c': tuple(model.sensor_encoder.mu_c.parameters()) + tuple(model.sensor_encoder.logvar_c.parameters()) + tuple(model.conditional_prior.parameters()),
+        'reconstruction': tuple(model.sensor_encoder.logvar_i.parameters()) + tuple(model.sensor_encoder.logvar_c.parameters()),
+    }
+    for name, parameters in paths.items():
+        grads = torch.autograd.grad(terms[name], parameters, retain_graph=True)
+        assert all(torch.isfinite(g).all() for g in grads) and sum(g.square().sum().item() for g in grads) > 0
+    assert all(g is None for g in torch.autograd.grad(terms['kl_i'], tuple(model.conditional_prior.parameters()), retain_graph=True, allow_unused=True))
+    kl_steps = diagonal_gaussian_kl(*(output[key] for key in ('mu_c','logvar_c','prior_mu_c','prior_logvar_c'))).masked_fill(~mask, 0)
+    torch.testing.assert_close(terms['kl_c'], kl_steps.sum(1).mean(), rtol=0, atol=0)
+    torch.testing.assert_close(terms['kl_c_per_step'], kl_steps.sum()/mask.sum(), rtol=1e-6, atol=1e-6)
+    changed_output = {key: value.masked_fill(~mask[:, :, None], float('nan')) if value.ndim == 3 else value for key,value in output.items()}
+    altered_losses = representation_loss(x.masked_fill(~mask[:, :, None], float('nan')), mask, changed_output, 1.)
+    for key in ('reconstruction','kl_i','kl_c','kl_c_per_step'):
+        torch.testing.assert_close(altered_losses[key],terms[key],rtol=0,atol=0)
+    # KL per valid step is 1, lengths are 3 and 1: flight-mean summed KL is 2.
+    toy_mask = torch.tensor([[True,True,True],[True,False,False]], device=x.device)
+    toy_c = torch.ones(2,3,2, device=x.device).masked_fill(~toy_mask[:, :, None],float('nan'))
+    zeros_c = torch.zeros_like(toy_c); zeros_i = torch.zeros(2,8,device=x.device)
+    toy = dict(mu_i=zeros_i,logvar_i=zeros_i,mu_c=toy_c,logvar_c=zeros_c,prior_mu_c=zeros_c,prior_logvar_c=zeros_c,x_hat=torch.zeros(2,3,14,device=x.device))
+    toy_terms = representation_loss(torch.zeros_like(toy['x_hat']),toy_mask,toy,1.)
+    torch.testing.assert_close(toy_terms['kl_c'],x.new_tensor(2.),rtol=0,atol=0)
+    torch.testing.assert_close(toy_terms['kl_c_per_step'],x.new_tensor(1.),rtol=0,atol=0)
+    model.eval()
+    with torch.no_grad():
+        posterior = model.posterior(x,w,mask)
+        different_w = model.posterior(x,w+.25,mask)
+        for key in ('mu_i','logvar_i'):
+            torch.testing.assert_close(posterior[key],different_w[key],rtol=0,atol=0)
+        for key in ('mu_c','logvar_c','prior_mu_c','prior_logvar_c'):
+            assert not torch.equal(posterior[key][mask],different_w[key][mask])
+        base_hi = model.predict_score(x,mask)
+        torch.testing.assert_close(base_hi,model.score(different_w['mu_i']),rtol=0,atol=0)
+        decode = lambda values, m: model.decode(values['mu_i'],values['mu_c'],time_positions(m,dtype=x.dtype))
+        base_mean = decode(posterior,mask)
+        assert not torch.equal(base_mean[mask],decode(different_w,mask)[mask])
+        # No direct W or u path: holding latent means fixed holds reconstruction.
+        torch.testing.assert_close(base_mean,model.decode(posterior['mu_i'],posterior['mu_c'],time_positions(mask),w+.25),rtol=0,atol=0)
+        padded_mask = F.pad(mask,(0,8),value=False)
+        padded_x = F.pad(x.masked_fill(~mask[:, :, None],float('nan')),(0,0,0,8),value=float('nan'))
+        padded_w = F.pad(w.masked_fill(~mask[:, :, None],float('nan')),(0,0,0,8),value=float('nan'))
+        extended = model.posterior(padded_x,padded_w,padded_mask)
+        for key in posterior:
+            a,b = (posterior[key][mask],extended[key][padded_mask]) if posterior[key].ndim==3 else (posterior[key],extended[key])
+            torch.testing.assert_close(a,b,rtol=1e-6,atol=1e-6)
+        torch.testing.assert_close(base_mean[mask],decode(extended,padded_mask)[padded_mask],rtol=1e-6,atol=1e-6)
+        torch.testing.assert_close(base_hi,model.predict_score(padded_x,padded_mask),rtol=1e-6,atol=1e-6)
+    assert (batch['unit'][pairs[:,0]] == batch['unit'][pairs[:,1]]).all()
+    assert (batch['cycle'][pairs[:,1]] - batch['cycle'][pairs[:,0]] >= 5).all()
+    print(f'PASS: temporal I[B,8]/C[B,T,2], W paths, summed masked KL, KL/order/reparameterization gradients, padding; order gradient norm={norm:.9g}',flush=True)
+    return dict(c_mode='temporal',latent_c_dim=2,decoder_use_w=False,initial_encoder_order_gradient_norm=norm,
+        temporal_shapes_checked=True,W_independent_I_HI=True,W_changes_C_prior_posterior_reconstruction=True,
+        KL_C_valid_time_sum_not_mean=True,KL_C_per_valid_step_recorded=True,KL_order_sampling_paths_checked=True,padding_checked=True)
+
+
 def representation_weights(config):
     settings = config['training']['representation']
     return {'reconstruction': 1., 'kl_i': settings['kl_i_weight'], 'kl_c': settings['kl_c_weight'], 'order': 0., 'l2': 0.}
@@ -532,6 +612,9 @@ def validate_joint_config(config):
     if 'joint' not in config['training']:
         raise ValueError('Joint training requires a training.joint configuration')
     settings = config['training']['joint']
+    if config['model'].get('c_mode', 'global') == 'temporal':
+        if settings['loss_weights'] != dict(reconstruction=1., kl_i=1., kl_c=1., order=10., l2=.0001):
+            raise ValueError('Temporal C requires the approved joint objective weights')
     if config['model'].get('score_mode', 'hi_head') == 'scalar_i':
         if not config['model'].get('decoder_use_w') or settings['loss_weights'] != dict(reconstruction=1., kl_i=1., kl_c=1., order=10., l2=0.):
             raise ValueError('Scalar I requires W decoder and approved loss weights')
@@ -582,6 +665,7 @@ def train_joint(config, smoke):
         totals = dict.fromkeys(('loss','reconstruction','kl_i','kl_c','order','l2'), 0.)
         clips = []
         order_norm = None
+        c_total, valid_steps = 0., 0
         for step, (indices, cpu_pairs) in enumerate(zip(schedule['flights'][epoch],schedule['pairs'][epoch])):
             batch = move_batch([datasets['dev'].flights[i] for i in indices.tolist()],device)
             pairs = cpu_pairs.to(device)
@@ -602,8 +686,13 @@ def train_joint(config, smoke):
             optimizer.step()
             for key in totals:
                 totals[key] += terms[key].detach().item()
+            if model.c_mode == 'temporal':
+                c_total += terms['kl_c'].detach().item() * len(batch['x'])
+                valid_steps += int(batch['mask'].sum())
         logs.append({'epoch':epoch+1,**{k:v/batches for k,v in totals.items()},
                      'encoder_order_grad_norm':order_norm,'mean_preclip_grad_norm':float(np.mean(clips))})
+        if model.c_mode == 'temporal':
+            logs[-1].update(kl_c_per_step=c_total/valid_steps, valid_steps=valid_steps)
         pd.DataFrame(logs).to_csv(root/'losses.csv',index=False,float_format='%.17g')
         if epoch == 0 or (epoch+1)%10 == 0 or epoch+1 == epochs:
             print(f'epoch={epoch+1}/{epochs}: '+ ' '.join(f'{k}={logs[-1][k]:.6f}' for k in totals),flush=True)
@@ -618,14 +707,14 @@ def train_joint(config, smoke):
         with torch.no_grad():
             scores[split] = model.score(means).cpu()
     score_scale = fit_score_scale(scores['dev'])
-    saved = {'score_mode': model.score_mode, 'scores': scores, 'hi_mapping': score_scale,
-             'stage':'joint','training_mode':'joint','structure':{**config['model'], 'decoder_use_w':model.decoder_use_w, 'score_mode':model.score_mode},
+    saved = {'c_mode': model.c_mode, 'objective_type':'joint_reconstruction_KL_order_head_L2', 'score_mode': model.score_mode, 'scores': scores, 'hi_mapping': score_scale,
+             'stage':'joint','training_mode':'joint','structure':{**config['model'], 'decoder_use_w':model.decoder_use_w, 'score_mode':model.score_mode, 'c_mode':model.c_mode},
              'mode':'smoke' if smoke else 'full','epoch':epochs,'seed':seed,'config':config,
              'loss_weights':weights,'actual_training':{**settings,'epochs':epochs,'seed':seed},
              'normalization':processed['normalization'],'columns':processed['columns'],
              'state_dict':{k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
              'initial_state_dict':initial,'initial_sha256':state_hash(initial),
-             'initialization_rule':'pytorch_defaults_scalar_no_head_then_isolated_w_layer' if model.score_mode == 'scalar_i' else 'legacy_modules_then_isolated_decoder_input_layer' if model.decoder_use_w else 'legacy_default',
+             'initialization_rule':'pytorch_default_modules_sensor_GRU_I_heads_C_concat_heads_condition_GRU_prior_heads_decoder_HIHead_seed42' if model.c_mode == 'temporal' else 'pytorch_defaults_scalar_no_head_then_isolated_w_layer' if model.score_mode == 'scalar_i' else 'legacy_modules_then_isolated_decoder_input_layer' if model.decoder_use_w else 'legacy_default',
              'sampling_rule':'CPU seed42 flight generator; independent CPU seed42 uniform-unit/valid-pair RNG; saved schedule',
              'reparameterization_rule':'torch seed42 after mechanism checks; default initialization then per-forward randn_like for I and C; architecture-dependent RNG consumption',
              'reparameterization_rng_digest':digest,

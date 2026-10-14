@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from data import FlightDataset, load_processed, read_reference, read_rul
-from model import fit_score_scale, scale_score, validate_score_scale
+from data import FlightDataset, collate_fn, load_processed, read_reference, read_rul
+from model import fit_score_scale, scale_score, validate_score_scale, time_positions
 from train import extract_training_means, load_ocald
 
 
@@ -167,9 +167,13 @@ def compare(evaluations, output_dir):
     import matplotlib.pyplot as plt
 
     root = Path(output_dir)
-    names = ('original', 'joint', 'joint_w')
-    if set(evaluations) != set(names):
-        raise ValueError('Comparison requires original, joint and joint_w evaluation directories')
+    if set(evaluations) == {'original', 'joint', 'joint_w'}:
+        names = ('original', 'joint', 'joint_w')
+    elif set(evaluations) == {'joint', 'joint_w', 'temporal_c'}:
+        names = ('joint', 'joint_w', 'temporal_c')
+    else:
+        raise ValueError('Comparison requires original/joint/joint_w or joint/joint_w/temporal_c')
+    reference_name = names[0]
     if any((root/f).exists() for f in ('comparison.csv', 'comparison_dev_curves.png', 'comparison_test_curves.png', 'comparison_sources.json')):
         raise ValueError('Refusing to overwrite comparison products')
     tables, reports, sources, rows = {}, {}, {}, []
@@ -184,8 +188,10 @@ def compare(evaluations, output_dir):
         if reports[name]['hi_mapping']['count'] != int((tables[name].split == 'dev').sum()):
             raise ValueError('Comparison mapping must cover all dev flights')
         model = reports[name]['structure']
-        if model['latent_i_dim'] != 8 or model['latent_c_dim'] != 8 or model.get('score_mode', 'hi_head') != 'hi_head':
-            raise ValueError('Comparison requires the three HIHead models with 8D I/C')
+        expected_c_mode = 'temporal' if name == 'temporal_c' else 'global'
+        if (model['latent_i_dim'] != 8 or model['latent_c_dim'] != (2 if name == 'temporal_c' else 8)
+                or model.get('c_mode', 'global') != expected_c_mode or model.get('score_mode', 'hi_head') != 'hi_head'):
+            raise ValueError('Comparison latent dimensions or C mode mismatch')
         if model.get('decoder_use_w', False) != (name == 'joint_w'):
             raise ValueError('Comparison model decoder W path mismatch')
         if reports[name]['epoch'] != 100 or reports[name]['training_stage'] != ('hi' if name == 'original' else 'joint'):
@@ -196,10 +202,10 @@ def compare(evaluations, output_dir):
         if reports[name]['loss_weights'] != expected_weights:
             raise ValueError('Comparison loss weights differ from the three approved versions')
         keys = ['split', 'unit', 'cycle']
-        if not tables[name][keys].equals(tables['original'][keys]):
+        if not tables[name][keys].equals(tables[reference_name][keys]):
             raise ValueError('Comparison flight keys differ')
         for field in ('hi_gt', 'rul'):
-            np.testing.assert_array_equal(tables[name][field], tables['original'][field])
+            np.testing.assert_array_equal(tables[name][field], tables[reference_name][field])
         for split in ('dev', 'test'):
             entry = reports[name]['splits'][split]['hi']
             rows.append({'model': name, 'split': split, 'available': entry['available'],
@@ -208,7 +214,7 @@ def compare(evaluations, output_dir):
     pd.DataFrame(rows).to_csv(root/'comparison.csv', index=False, float_format='%.17g')
     (root/'comparison_sources.json').write_text(json.dumps(sources, indent=2)+'\n')
     for split in ('dev', 'test'):
-        groups = list(tables['original'].loc[tables['original'].split == split].groupby('unit'))
+        groups = list(tables[reference_name].loc[tables[reference_name].split == split].groupby('unit'))
         figure, axes = plt.subplots((len(groups)+2)//3, 3, figsize=(18, 3.5*((len(groups)+2)//3)), layout='constrained', squeeze=False)
         try:
             for axis, (unit, reference) in zip(axes.flat, groups):
@@ -228,14 +234,88 @@ def compare(evaluations, output_dir):
     return root
 
 
+def check_i_usage(checkpoint_path, output_dir):
+    """Frozen posterior-mean reconstructions with deterministic within-unit I swaps."""
+    from losses import reconstruction_loss
+
+    root = Path(output_dir)
+    if any((root/name).exists() for name in ('i_swap.csv','i_swap.json')):
+        raise ValueError('Refusing to overwrite I swap artifacts')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        torch.set_num_threads(1)
+    model, checkpoint = load_ocald(checkpoint_path,device)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    processed = load_processed(checkpoint['config'])
+    rows = []
+    with torch.no_grad():
+        for split in ('dev','test'):
+            flights = FlightDataset(processed,split).flights
+            pairs = []
+            for unit in sorted({flight['unit'] for flight in flights}):
+                ordered = sorted((flight for flight in flights if flight['unit']==unit),key=lambda flight:flight['cycle'])
+                for offset in range(len(ordered)//2):
+                    early, late = ordered[offset], ordered[-offset-1]
+                    if late['cycle']-early['cycle'] >= 5:
+                        pairs.append((early,late))
+            if not pairs:
+                raise ValueError('No within-unit I swap pairs')
+            for start in range(0,len(pairs),8):
+                selected = pairs[start:start+8]
+                batch_flights = [flight for pair in selected for flight in pair]
+                batch = {key:value.to(device) for key,value in collate_fn(batch_flights).items()}
+                posterior = model.posterior(batch['x'],batch['w'],batch['mask'])
+                mu_i, mu_c = posterior['mu_i'], posterior['mu_c']
+                positions = time_positions(batch['mask'],dtype=batch['x'].dtype)
+                decoder_w = batch['w'].masked_fill(~batch['mask'][:,:,None],0) if model.decoder_use_w else None
+                partner = torch.arange(len(batch_flights),device=device).reshape(-1,2).flip(1).reshape(-1)
+                assert (batch['unit'] == batch['unit'][partner]).all() and (batch['cycle'] != batch['cycle'][partner]).all()
+                base = model.decode(mu_i,mu_c,positions,decoder_w)
+                swapped = model.decode(mu_i[partner],mu_c,positions,decoder_w)
+                base_error = reconstruction_loss(batch['x'],base,batch['mask'],1.)
+                swapped_error = reconstruction_loss(batch['x'],swapped,batch['mask'],1.)
+                if not torch.isfinite(base_error).all() or not torch.isfinite(swapped_error).all():
+                    raise RuntimeError('Nonfinite I swap errors; no fallback')
+                for index,flight in enumerate(batch_flights):
+                    rows.append(dict(split=split,unit=flight['unit'],cycle=flight['cycle'],
+                        partner_cycle=batch_flights[int(partner[index])]['cycle'],valid_steps=int(batch['mask'][index].sum()),
+                        base_reconstruction=base_error[index].item(),swapped_reconstruction=swapped_error[index].item(),
+                        delta_reconstruction=(swapped_error[index]-base_error[index]).item(),
+                        mu_i_distance=(mu_i[partner[index]]-mu_i[index]).norm().item()))
+    table = pd.DataFrame(rows)
+    root.mkdir(parents=True,exist_ok=True)
+    table.to_csv(root/'i_swap.csv',index=False,float_format='%.17g')
+    report = {'source_checkpoint':str(checkpoint_path),'checkpoint_sha256':hashlib.sha256(Path(checkpoint_path).read_bytes()).hexdigest(),
+              'c_mode':model.c_mode,'decoder_use_w':model.decoder_use_w,
+              'rule':'Within each dev/test unit, sort by cycle; pair first-last, second-second-last, etc.; disjoint pairs; min cycle gap 5; both swap directions; unpaired center excluded.',
+              'reconstruction':'Posterior means only, no latent sampling; X, recipient C posterior means, W decoder input if applicable, time positions and mask held fixed; sigma_x_squared=1',
+              'interpretation':'Decoder sensitivity to I only; not degradation purity or physical disentanglement evidence','splits':{}}
+    for split,group in table.groupby('split',sort=False):
+        base, swapped = group.base_reconstruction.mean(), group.swapped_reconstruction.mean()
+        elements = int(group.valid_steps.sum())*checkpoint['config']['data']['sensor_dim']
+        report['splits'][split] = dict(pairs=len(group)//2,flights=len(group),base_reconstruction=float(base),swapped_reconstruction=float(swapped),
+            delta_reconstruction=float(swapped-base),relative_change=float((swapped-base)/base) if base != 0 else None,
+            base_element_mse=float(2*group.base_reconstruction.sum()/elements),swapped_element_mse=float(2*group.swapped_reconstruction.sum()/elements),
+            mean_mu_i_distance=float(group.mu_i_distance.mean()))
+    (root/'i_swap.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+    print('I swap check:',json.dumps(report['splits'],indent=2))
+    return root
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', help='Legacy argument; use checkpoint configuration snapshot')
     parser.add_argument('--checkpoint')
     parser.add_argument('--output-dir')
+    parser.add_argument('--i-swap',action='store_true',help='No-training posterior-mean I sensitivity check')
     parser.add_argument('--compare', nargs=3, metavar='NAME=EVALUATION_DIR')
     args = parser.parse_args()
-    if args.compare:
+    if args.i_swap:
+        if not args.checkpoint or args.compare or not args.output_dir:
+            parser.error('--i-swap requires --checkpoint and --output-dir, without --compare')
+        check_i_usage(args.checkpoint,args.output_dir)
+    elif args.compare:
         if args.checkpoint or not args.output_dir:
             parser.error('--compare requires --output-dir and cannot accompany --checkpoint')
         compare(dict(item.split('=', 1) for item in args.compare), args.output_dir)

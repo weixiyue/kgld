@@ -111,6 +111,8 @@ def verify_data(config):
 
 
 def verify_model(config):
+    if config["model"].get("c_mode", "global") == "temporal":
+        return verify_pipeline(config)
     from losses import (diagonal_gaussian_kl, head_l2, hi_loss, order_loss,
                         reconstruction_loss, representation_loss)
     from model import HIHead, OCALD, time_positions
