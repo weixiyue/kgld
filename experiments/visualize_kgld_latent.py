@@ -85,10 +85,16 @@ def compare_saved_scores(points: pd.DataFrame, checkpoint_file: Path, digest: st
                               validate='one_to_one', indicator=True, suffixes=('', '_saved'))
         if not joined['_merge'].eq('both').all():
             raise ValueError(f'existing test score keys differ: {path}')
-        np.testing.assert_allclose(joined.score, joined.score_saved, rtol=RTOL, atol=ATOL,
-                                   err_msg=f'existing scores differ: {path}')
-        comparisons.append(dict(path=str(path.resolve()), status='matched same checkpoint SHA256',
-            n_test=len(saved), max_absolute_error=float(np.max(np.abs(joined.score - joined.score_saved)))))
+        consistent = bool(np.allclose(joined.score, joined.score_saved, rtol=RTOL, atol=ATOL))
+        error = float(np.max(np.abs(joined.score - joined.score_saved)))
+        comparisons.append(dict(path=str(path.resolve()), checkpoint_sha256_matched=True,
+            status='scores within tolerance' if consistent else 'score difference exceeds tolerance',
+            source_device=metadata.get('device'), scores_within_tolerance=consistent,
+            n_test=len(saved), max_absolute_error=error))
+        if not consistent:
+            print(f'Historical score discrepancy: {path}; source device={metadata.get("device")}; '
+                  f'max absolute error={error:.9g}; rtol={RTOL}, atol={ATOL}. '
+                  'Original scores are preserved; this difference is recorded, not corrected.', flush=True)
     return comparisons
 
 
@@ -224,6 +230,8 @@ def run(config_path: str, checkpoint_path: str, output_dir: str,
         'The arrow uses only the trained HIHead, points toward increasing HI and is not a degradation-time arrow. '
         'Both plots show identical unmodified points and limits. Category overlap alone cannot demonstrate complete '
         'disentanglement. Reference HI is used only for coloring and diagnostics. No training, PCA or supervised probe.\n\n'
+        f'Historical score checks (same SHA256, complete key coverage): '
+        f'{json.dumps(comparisons)}. Cross-device discrepancies are reported, not treated as exact equivalence.\n\n'
         f'Fc labels: {FC_BASIS}\n\nReference key limitation: {provenance}.\n'
     )
     (output / 'README.md').write_text(note, encoding='utf-8')

@@ -100,6 +100,7 @@ class LatentVisualization(unittest.TestCase):
             self.assertEqual(len(points), 12)
             self.assertEqual(metadata['units'], [5, 6])
             self.assertEqual(metadata['existing_score_comparisons'][0]['n_test'], 12)
+            self.assertTrue(metadata['existing_score_comparisons'][0]['scores_within_tolerance'])
             self.assertLess(metadata['max_projection_absolute_error'], 1e-6)
             self.assertEqual(metadata['resolved_config'], config)
             self.assertEqual(set(p.name for p in output.iterdir()),
@@ -110,6 +111,10 @@ class LatentVisualization(unittest.TestCase):
             self.assertEqual(old_files, {p: p.read_bytes() for p in old_files})
             with self.assertRaises(FileExistsError):
                 visual.run(str(source / 'config.yaml'), str(cp_path), str(output), 'cpu')
+            scores.assign(score=scores.score + 1).to_csv(source / 'scores.csv', index=False)
+            discrepancy = visual.compare_saved_scores(points, cp_path, metadata['checkpoint']['sha256'])[0]
+            self.assertFalse(discrepancy['scores_within_tolerance'])
+            self.assertEqual(discrepancy['status'], 'score difference exceeds tolerance')
             # Matching checkpoint identity must not hide mismatching flight keys.
             scores.iloc[:-1].to_csv(source / 'scores.csv', index=False)
             with self.assertRaisesRegex(ValueError, 'keys differ'):

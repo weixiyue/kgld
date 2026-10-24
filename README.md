@@ -446,7 +446,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_loss_abla
 ## 二维退化潜在空间与 HI 投影
 
 先确认论文对应的运行及 checkpoint；`runs/kgld` 和 `runs/kgld_tuning` 是不同运行，
-不能根据测试表现或目录时间选择。以下示例仅在确认使用 `runs/kgld` 后执行：
+不能根据测试表现或目录时间选择。本次已由用户确认使用 `runs/kgld/best.pt`（epoch 198）：
 
 ```bash
 python -m experiments.visualize_kgld_latent \
@@ -463,6 +463,13 @@ python -m experiments.visualize_kgld_latent \
 保存 `latent_points.csv`、`projection.json`、300 dpi PNG、矢量 PDF 和简短 `README.md`。
 元数据包括实际配置、checkpoint SHA256、数据/参考标签来源、投影误差及同 checkpoint
 历史分数对照；不会覆盖原结果。类别重叠本身不能证明完全解耦。
+
+上述命令已在真实 DS03 上执行：438 个 test flight、发动机 10–15，Fc 1/2/3 分别为
+169/67/202 个；`mu_d @ a` 与公共原始分数最大误差 `5.94e-8`。
+与同 checkpoint 的既有 CPU 重评 `runs/main_results/evaluations/kgld/scores.csv` 完全一致。
+原 CUDA 分数的最大差为 `1.67e-4`，超出严格对照容差，已在输出元数据中显式记录；
+当前环境无 CUDA，未进一步隔离差异原因，不声称跨设备逐位复现。
+PNG 已打开检查：参考 HI 沿点云呈明显梯度，Fc 类别存在重叠；不据此宣称完全解耦。
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_kgld_latent_visualization.py -v
