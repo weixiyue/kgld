@@ -443,6 +443,31 @@ full 的已有结果由后续自行合并。
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_loss_ablation.py -v
 ```
 
+## 二维退化潜在空间与 HI 投影
+
+先确认论文对应的运行及 checkpoint；`runs/kgld` 和 `runs/kgld_tuning` 是不同运行，
+不能根据测试表现或目录时间选择。以下示例仅在确认使用 `runs/kgld` 后执行：
+
+```bash
+python -m experiments.visualize_kgld_latent \
+  --config runs/kgld/config.yaml --checkpoint runs/kgld/best.pt \
+  --output-dir runs/kgld_latent_visualization --device cpu --batch-size 32 --threads 2
+```
+
+输出目录必须不存在。入口复用公共缓存、确定性表征提取、原始分数推理及参考 HI 键关联，
+仅支持二维退化后验均值，不训练、不采样、不做 PCA 或监督线性探测。
+提取全部 test flight，Fc 从各样本 `u` 末三位 one-hot 恢复；未核实航程语义前标为 Fc 1/2/3。
+两幅图使用相同原始坐标及范围，分别按参考 HI 和 Fc 着色。箭头使用训练所得
+`model.hi_head.linear.weight`，指向 HI 增大方向，不表示退化时间方向。
+
+保存 `latent_points.csv`、`projection.json`、300 dpi PNG、矢量 PDF 和简短 `README.md`。
+元数据包括实际配置、checkpoint SHA256、数据/参考标签来源、投影误差及同 checkpoint
+历史分数对照；不会覆盖原结果。类别重叠本身不能证明完全解耦。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_kgld_latent_visualization.py -v
+```
+
 ## 批量重评与论文主结果表
 
 先列出待评估运行（不加载 checkpoint、不推理、不创建输出目录）：
