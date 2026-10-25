@@ -506,6 +506,38 @@ Fc 从 `u` 的 one-hot 恢复并按 split/unit/cycle 关联，语义未核实前
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_latent_flight_category.py -v
 ```
 
+## 按马赫数和高度着色的连续工况对照
+
+直接复用上一实验导出的完整后验均值、测试坐标和 dev 拟合 PCA，不重新推理或拟合：
+
+```bash
+python -m experiments.visualize_continuous_conditions \
+  --latent-dir runs/kgld_latent_flight_category \
+  --output-dir runs/kgld_continuous_conditions
+```
+
+输出目录必须不存在；缺少上一步导出时，先执行上一节命令，不以模拟表示替代。
+新增一张 2×2 图：第一行原始二维 `mu_d`，第二行相同测试 flight 的 `mu_c` PCA，
+两列分别按飞行平均马赫数和平均高度着色。同列共用 viridis 色条及完整测试范围，
+同一行共享坐标，不裁剪、不筛样、不添加 HI 箭头。
+
+通道映射读取原始 HDF 的 `W_var`，当前为 `[alt, Mach, TRA, T2]`。
+工况均值读取缓存 `u` 前四维，来自每条 flight 下采样后、截断与补零前的完整有效序列。
+马赫数使用缓存 dev 全局统计量反标准化；高度物理单位未获现有文件证实，
+因此明确绘制 **dev 标准化均值**，色条标注 `Mean altitude (dev z-score)`，不猜测米或英尺。
+
+保存 `plot_data.csv`、来源/计算公式/单位/PCA 与色条范围的 `metadata.json`、
+300 dpi PNG、矢量 PDF 和简短说明。颜色梯度仅说明关联，不能单独证明完全解耦。
+
+真实绘图包含 438 个测试 flight，复用的 PCA 解释方差仍为 35.62%/31.83%（累计 67.44%）。
+全部原始 flight 的工况均值与缓存 `u` 精确一致，包括 63 条长度超过固定 `L_max` 的 flight；
+马赫数反标准化相对直接原始均值的最大差约 `2.85e-7`。图片已打开并修正标签布局。
+两类表示均出现区域性颜色变化及局部混合，不据此断言哪一种梯度普遍更清晰。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_continuous_conditions.py -v
+```
+
 ## 批量重评与论文主结果表
 
 先列出待评估运行（不加载 checkpoint、不推理、不创建输出目录）：
