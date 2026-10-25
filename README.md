@@ -475,6 +475,37 @@ PNG 已打开检查：参考 HI 沿点云呈明显梯度，Fc 类别存在重叠
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_kgld_latent_visualization.py -v
 ```
 
+## 退化与工况表示的 Flight category 对照
+
+沿用上述已确认的论文 checkpoint，左图直接使用二维 `mu_d`，右图仅对八维 `mu_c`
+做 PCA。PCA 在全部 dev flight 的原始后验均值上拟合，固定 `svd_solver="full"`，
+不逐维标准化、不使用类别标签，test 仅 transform。两图均保留全部测试样本，使用相同
+Fc 配色及各自等比例坐标轴；不添加 HI 箭头，不强制共享数值范围。
+
+```bash
+python -m experiments.visualize_latent_flight_category \
+  --config runs/kgld/config.yaml --checkpoint runs/kgld/best.pt \
+  --output-dir runs/kgld_latent_flight_category --device cpu --batch-size 32 --threads 2
+```
+
+输出目录必须不存在。保存 `latent_features.csv`（完整 dev/test 均值与键）、
+`test_projection.csv`、`pca_parameters.json`（含 dev 拟合键和数值参数）、`metadata.json`、
+300 dpi PNG、矢量 PDF 及简短说明；旧可视化结果原地保留。
+Fc 从 `u` 的 one-hot 恢复并按 split/unit/cycle 关联，语义未核实前仍使用 Fc 1/2/3。
+入口按 checkpoint SHA256 查找上次潜在空间结果，核对测试键和 `mu_d`；没有匹配产物时明确记录。
+
+工况分支已通过 FiLM 接收包含 Fc 的条件输入，因此类别结构可支持其编码了航程类别信息，
+不能单独证明完全解耦或工况识别的泛化能力。二维 PCA 未保留的信息也须纳入解释。
+
+真实 DS03 运行使用 663 个 dev flight 拟合 PCA、438 个 test flight 绘图，测试 Fc 1/2/3
+分别为 169/67/202 个。PC1 解释 35.62%、PC2 解释 31.83%，累计 67.44%；
+新 `mu_d` 与上次同 checkpoint 产物完全一致。PNG 已打开检查：退化表示类别广泛重叠，
+工况 PCA 中类别位置差异更明显，但仍有重叠，不能描述为完全分离的三团。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_latent_flight_category.py -v
+```
+
 ## 批量重评与论文主结果表
 
 先列出待评估运行（不加载 checkpoint、不推理、不创建输出目录）：
