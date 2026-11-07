@@ -506,6 +506,24 @@ Fc 从 `u` 的 one-hot 恢复并按 split/unit/cycle 关联，语义未核实前
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p test_latent_flight_category.py -v
 ```
 
+## 论文双分支潜在空间组合图
+
+将已有实验合并为一张左右图：左侧原始二维 `mu_d` 按参考 HI 着色，保留训练所得 HI 头的
+HI 增大方向；右侧复用 dev 拟合的 `mu_c` PCA，按 Fc 1/2/3 着色并标注解释方差。
+按测试 flight 键核对两侧完全一致，同时检查 checkpoint SHA256、缓存来源、退化坐标、
+HI 投影和 PCA 拟合键；不重新推理或拟合。
+
+```bash
+python -m experiments.plot.plot_latent_summary \
+  --health-dir runs/kgld_latent_visualization \
+  --operating-dir runs/kgld_latent_flight_category \
+  --output-dir runs/kgld_latent_summary
+```
+
+输出目录必须不存在，保存 `latent_summary.png`（300 dpi）、矢量 PDF、绘图数据和来源元数据。
+只生成这一张组合图。图展示两个分支各自编码的信息，不能单独证明完全解耦；
+工况分支的条件输入本身包含 Fc，右图的类别结构也不能单独证明类别识别的泛化能力。
+
 ## 按马赫数和高度着色的连续工况对照
 
 直接复用上一实验导出的完整后验均值、测试坐标和 dev 拟合 PCA，不重新推理或拟合：
