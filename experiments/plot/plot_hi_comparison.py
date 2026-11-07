@@ -23,9 +23,9 @@ from matplotlib.ticker import MaxNLocator
 
 STYLES = [
     ("KGLD", "#D55E00", "kgld"),
-    ("Proposal-C", "#0072B2", "proposal_c"),
-    ("Residual-A", "#009E73", "residual_a"),
-    ("Residual-B", "#CC79A7", "residual_b"),
+    ("Hybrid AE", "#0072B2", "proposal_c"),
+    ("Residual-AE", "#009E73", "residual_a"),
+    ("Residual-Regression", "#CC79A7", "residual_b"),
 ]
 
 
